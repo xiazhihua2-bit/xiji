@@ -30,6 +30,7 @@
   --blue-soft:rgba(0,122,255,.10);
   --up:#E0312F;          /* 涨 · 红（中国习惯） */
   --down:#12A150;        /* 跌 · 绿 */
+  --payout:#12A150;      /* 派息日 · 绿（与「除权除息」的红色区分开） */
   --dividend:#E8461F;    /* 分红金额 · 橙红（对齐息记） */
   --dividend-mid:#E8A87C;/* 柱状图 / 进度条 · 浅橙 */
   --dividend-soft:rgba(232,70,31,.10);
@@ -313,7 +314,7 @@ a{ color:var(--blue); text-decoration:none; }
 .cal-dot{ width:5px; height:5px; border-radius:50%; }
 .cal-dot.register{ background:var(--blue); }
 .cal-dot.exdiv{ background:var(--up); }
-.cal-dot.payout{ background:var(--dividend); }
+.cal-dot.payout{ background:var(--payout); }
 .cal-legend{ display:flex; gap:14px; justify-content:center; margin-top:12px; font-size:11.5px; color:var(--text-2); flex-wrap:wrap; }
 .cal-legend i{ display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:4px; vertical-align:middle; }
 .cal-banner{
@@ -536,7 +537,9 @@ table.tbl tbody tr:active{ background:var(--card-2); }
 .hc-id{ flex:1; min-width:0; }
 .hc-name{ font-size:15.5px; font-weight:650; letter-spacing:-.2px; display:flex; align-items:center; gap:5px; }
 .hc-name .nm{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.hc-code{ font-size:11.5px; color:var(--text-3); margin-top:2px; }
+/* 第二行：代码 + 涨跌幅徽章（徽章从名字行下移到这里，腾出整行给名字） */
+.hc-code{ display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--text-3); margin-top:3px; }
+.hc-code .chg{ font-size:10.5px; padding:1px 6px; border-radius:5px; }
 .hc-right{ text-align:right; flex:0 0 auto; }
 .hc-div{ font-size:19px; font-weight:730; letter-spacing:-.5px; color:var(--dividend); font-variant-numeric:tabular-nums; }
 .hc-div-lbl{ font-size:10.5px; color:var(--text-3); margin-top:1px; }
@@ -978,6 +981,13 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   .metric .v{ font-size:15.5px; }
   .metric .k{ font-size:10px; }
   .exp-grid{ grid-template-columns:1fr; }
+  /* 极窄屏（iPhone SE 等）：收紧卡片头部，保证名字完整、代码 + 涨跌幅那行不溢出 */
+  .hc-main{ padding:12px 10px 10px; }
+  .hc-avatar{ width:32px; height:32px; font-size:13px; border-radius:10px; }
+  .hc-head{ gap:8px; }
+  .hc-div{ font-size:16.5px; }
+  .hc-code{ font-size:10.5px; gap:4px; }
+  .hc-code .chg{ font-size:9.5px; padding:1px 4px; }
 }
 
 </style>
@@ -6485,11 +6495,11 @@ XJ.store = (function () {
       annualYear: null,         // 年度总览选中年份
       annualMonth: null,        // 年度总览选中月份
       calView: 'calendar',      // calendar | annual
-      chartRange: '3m',         // 资产变动曲线区间：1m | 3m | 1y | all
       pendCollapsed: false,     // 分红日历「等待除权」卡片是否折叠
       foldPlans: true,          // 个股页「分红档案」是否折叠（默认收起，内容较长）
       foldTx: true,             // 个股页「交易明细」是否折叠（默认收起）
       foldMineTx: true,         // 我的页「交易流水」是否折叠（默认收起）
+      // 资产走势卡挂两处，控件状态各自独立：'' = 首页（nwXxx），'an' = 账户分析（anNwXxx）
       nwGran: 'day',            // 资产走势曲线：day | month
       nwRange: null,            // 资产走势曲线区间：1m | 6m | ytd | all | custom（null 时自适应）
       nwBeg: '', nwEnd: '',     // 自定义区间
@@ -7074,9 +7084,10 @@ XJ.views.overview = (function () {
   function holdingCard(h) {
     var chg = h.changePct;
     var dir = (chg === null || chg === undefined) ? 'flat' : U.direction(chg);
-    var tag = h.costRecovered
-      ? '<span class="hc-tag pill div">已回本</span>'
-      : (h.costMethod !== 'weighted' ? '<span class="hc-tag pill gray">' + C.costMethodLabel(h.costMethod) + '</span>' : '');
+    /* 成本口径标签（分红摊薄 / 加权平均 / 摊薄成本）不再挂在名字旁 —— 太占地方，
+       名字会被挤到只剩一两个字。口径在个股详情页的「持仓明细」里仍完整可见。
+       这里只保留极少触发、但出现即重要的「已回本」。 */
+    var tag = h.costRecovered ? '<span class="hc-tag pill div">已回本</span>' : '';
     var mvDec = (h.marketValue !== null && Math.abs(h.marketValue) >= 10000) ? 0 : 2;
 
     /* 当日分时：只在交易时段内展示（非交易时段不画一条不动的线，免得看着像实时） */
@@ -7102,10 +7113,11 @@ XJ.views.overview = (function () {
       '<div class="hc-head">' +
       UI.avatar(h.name, h.symbol, 42, C.logoOf(h), 'hc-avatar') +
       '<div class="hc-id">' +
-      '<div class="hc-name"><span class="nm">' + U.esc(h.name) + '</span>' +
+      /* 名字独占第一行（涨跌幅徽章已移到下一行的代码旁），窄屏也能完整显示 */
+      '<div class="hc-name"><span class="nm">' + U.esc(h.name) + '</span>' + tag + '</div>' +
+      '<div class="hc-code">' + U.esc(XJ.market.displayCode(h.symbol)) +
       (chg === null || chg === undefined ? '' : '<span class="chg ' + dir + '">' + U.signPct(chg) + '</span>') +
-      tag + '</div>' +
-      '<div class="hc-code">' + U.esc(XJ.market.displayCode(h.symbol)) + '</div>' +
+      '</div>' +
       '</div>' +
       '<div class="hc-right">' +
       '<div class="hc-div">' + U.moneySign(h.predictedDividend) + '</div>' +
@@ -7233,9 +7245,12 @@ XJ.views.overview = (function () {
  *   净资产   —— 持仓总市值 + 累计已收分红 − 累计净投入
  *   收益率   —— 时间加权收益率（TWR），剔除加仓影响，可与指数公平对比
  *
- * 收益率模式下叠加对比指数（上证 / 沪深300 / 恒生 / 纳斯达克 / 标普500 / 日经225 / 台湾加权 / 韩国KOSPI），
+ * 收益率模式下叠加对比指数（上证 / 沪深300 / 恒生 / 纳斯达克 / 标普500；日经225 / 台湾加权 / 韩国KOSPI
+ * 无免费历史源，整项不出现在图例里），
  * 指数图例可多选；折线与 K 线（蜡烛）两种画法切换；拖动时显示竖向高亮带与多值读数。
  * 区间：当日 / 本月 / 近三月 / 近6月 / 今年 / 全部 / 自定义。卡片整体可收起。
+ *
+ * 同一张卡挂两处：首页（ns=''）与账户分析（ns='an'），两处控件状态各自独立。
  *
  * 数据口径见 calc.marketValueSeries（市值/净投入/累计分红）与 calc.twrIndex（TWR）。
  */
@@ -7250,6 +7265,20 @@ XJ.views.networth = (function () {
   var METRICS = [['mv', '持仓市值'], ['nw', '净资产'], ['ret', '收益率']];
   var MODES = [['line', '曲线收益率'], ['candle', 'K线收益率']];
 
+  /* 同一张卡挂两处（首页 + 账户分析），每处一套**独立**的控件状态：
+     ns = ''    → nwMetric / nwRange / nwGran / nwBeg / nwEnd / nwMode / nwCollapsed
+     ns = 'an'  → anNwMetric / anNwRange / …（前缀 + 首字母大写）
+     app.js 的动作处理器通过 keyOf() 写入对应实例，互不影响。 */
+  var NS_BASE = {
+    metric: 'nwMetric', range: 'nwRange', gran: 'nwGran',
+    beg: 'nwBeg', end: 'nwEnd', mode: 'nwMode', collapsed: 'nwCollapsed',
+  };
+  function keyOf(ns, field) {
+    var base = NS_BASE[field];
+    return ns ? ns + base.charAt(0).toUpperCase() + base.slice(1) : base;
+  }
+  function getUI(ns, field) { return XJ.store.ui[keyOf(ns, field)]; }
+
   /** 区间自适应：历史不足半年时默认看全部，否则默认近 6 月 */
   function defaultRange(state, accountId) {
     var txs = state.transactions.filter(function (t) {
@@ -7262,10 +7291,12 @@ XJ.views.networth = (function () {
   }
 
   /* 重建结果缓存：marketValueSeries 要按「每个交易日 × 每只标的」重算，是这一页最重的一步，
-     而排序、筛选、折叠等纯 UI 操作都会触发重渲染。指纹包含了所有会影响结果的量。 */
-  var cache = { key: '', value: null };
+     而排序、筛选、折叠等纯 UI 操作都会触发重渲染。指纹包含了所有会影响结果的量。
+     两处实例区间/粒度可能不同，因此按指纹存多条（超过 4 条淘汰最旧的）。 */
+  var cache = {};
+  var cacheOrder = [];
 
-  function fingerprint(st, acc, range, gran) {
+  function fingerprint(st, acc, range, gran, beg, end) {
     var s = st.state;
     var histStamp = '';
     Object.keys(s.priceHistory || {}).forEach(function (k) {
@@ -7274,19 +7305,21 @@ XJ.views.networth = (function () {
     Object.keys(s.indexHistory || {}).forEach(function (k) {
       histStamp += k + ':' + ((s.indexHistory[k] || {}).bars || []).length + ';';
     });
-    return [acc, range, gran, st.ui.nwBeg || '', st.ui.nwEnd || '',
+    return [acc, range, gran, beg || '', end || '',
       s.transactions.length, s.received.length,
       Object.keys(s.snapshots || {}).length, histStamp,
       (s.settings.fx && s.settings.fx.HKD) || '', (s.settings.fx && s.settings.fx.USD) || '',
     ].join('|');
   }
 
-  function build(st) {
+  function build(st, ns) {
     var acc = st.acc();
-    var ui = st.ui;
-    var range = ui.nwRange || defaultRange(st.state, acc);
-    var key = fingerprint(st, acc, range, ui.nwGran);
-    if (cache.key === key && cache.value) return cache.value;
+    var range = getUI(ns, 'range') || defaultRange(st.state, acc);
+    var gran = getUI(ns, 'gran') === 'month' ? 'month' : 'day';
+    var beg = getUI(ns, 'beg') || '';
+    var end = getUI(ns, 'end') || '';
+    var key = fingerprint(st, acc, range, gran, beg, end);
+    if (cache[key]) return cache[key];
 
     var priceMap = {};
     Object.keys(st.state.priceHistory || {}).forEach(function (sym) {
@@ -7294,44 +7327,50 @@ XJ.views.networth = (function () {
       if (rec && rec.points && rec.points.length) priceMap[sym] = rec.points;
     });
 
-    var cr = XJ.calc.chartRange(range, U.today(), ui.nwBeg, ui.nwEnd);
+    var cr = XJ.calc.chartRange(range, U.today(), beg, end);
     var res = XJ.calc.marketValueSeries(st.state, acc, priceMap, {
       beg: cr.beg, end: cr.end, fx: st.state.settings.fx,
     });
     var value = {
       range: range, beg: cr.beg, end: cr.end, res: res,
-      series: XJ.calc.downsample(res.series, ui.nwGran),
-      twr: XJ.calc.downsample(XJ.calc.twrIndex(res.series), ui.nwGran),
+      series: XJ.calc.downsample(res.series, gran),
+      twr: XJ.calc.downsample(XJ.calc.twrIndex(res.series), gran),
     };
-    cache.key = key;
-    cache.value = value;
+    cache[key] = value;
+    cacheOrder.push(key);
+    while (cacheOrder.length > 4) delete cache[cacheOrder.shift()];
     return value;
   }
 
-  function render() {
+  /** ns = '' 首页实例；ns = 'an' 账户分析实例（两套控件状态互不影响） */
+  function render(ns) {
+    ns = ns || '';
     var st = XJ.store;
-    var ui = st.ui;
-    var metric = (ui.nwMetric === 'nw' || ui.nwMetric === 'ret') ? ui.nwMetric : 'mv';
-    var mode = ui.nwMode === 'candle' ? 'candle' : 'line';
-    var collapsed = !!ui.nwCollapsed;
-    var b = build(st);
+    var metricV = getUI(ns, 'metric');
+    var metric = (metricV === 'nw' || metricV === 'ret') ? metricV : 'mv';
+    var mode = getUI(ns, 'mode') === 'candle' ? 'candle' : 'line';
+    var gran = getUI(ns, 'gran') === 'month' ? 'month' : 'day';
+    var collapsed = !!getUI(ns, 'collapsed');
+    var beg = getUI(ns, 'beg') || '';
+    var end = getUI(ns, 'end') || '';
+    var b = build(st, ns);
     var series = b.series;
 
     var rangeLabel = (RANGES.filter(function (r) { return r[0] === b.range; })[0] || ['', '全部'])[1];
     var metricLabel = (METRICS.filter(function (m) { return m[0] === metric; })[0] || ['', ''])[1];
-    var granLabel = ui.nwGran === 'month' ? '月粒度' : '日粒度';
+    var granLabel = gran === 'month' ? '月粒度' : '日粒度';
     var isPct = metric === 'ret';
     var isToday = b.range === 'today';
 
-    var html = '<div class="card nw-card' + (collapsed ? ' collapsed' : '') + '">';
+    var html = '<div class="card nw-card' + (collapsed ? ' collapsed' : '') + '" data-ns="' + ns + '">';
 
-    /* 标题行 */
+    /* 标题行（首页那张带 01 序号；账户分析里不带） */
     html += '<div class="card-head" style="margin-bottom:6px">' +
-      '<span class="nw-no">01</span>' +
+      (ns ? '' : '<span class="nw-no">01</span>') +
       '<h2>资产走势</h2><div class="spacer"></div>' +
       '<span class="hint">' + U.esc(metricLabel) + ' · ' + U.esc(rangeLabel) +
       (collapsed || isToday ? '' : ' · ' + U.esc(granLabel)) + '</span>' +
-      '<button class="fold-head nw-fold" data-act="toggleNw" aria-label="展开或收起">' +
+      '<button class="fold-head nw-fold" data-act="toggleNw" data-ns="' + ns + '" aria-label="展开或收起">' +
       '<span class="fold-caret' + (collapsed ? ' folded' : '') + '">' + UI.icon('chevron', 14) + '</span>' +
       '</button></div>';
 
@@ -7354,27 +7393,27 @@ XJ.views.networth = (function () {
     html += '<div class="nw-toprow">' +
       '<div class="nw-metrics">' + METRICS.map(function (m) {
         return '<button class="nw-metric' + (m[0] === metric ? ' active' : '') +
-          '" data-act="setNwMetric" data-v="' + m[0] + '">' + m[1] + '</button>';
+          '" data-act="setNwMetric" data-ns="' + ns + '" data-v="' + m[0] + '">' + m[1] + '</button>';
       }).join('') + '</div>' +
       '<div class="spacer" style="flex:1"></div>' +
       (isToday ? '' : '<div class="segmented nw-seg nw-gran">' + GRANS.map(function (g) {
-        return '<button class="' + (g[0] === ui.nwGran ? 'active' : '') + '" data-act="setNwGran" data-v="' +
-          g[0] + '">' + g[1] + '</button>';
+        return '<button class="' + (g[0] === gran ? 'active' : '') + '" data-act="setNwGran" data-ns="' + ns +
+          '" data-v="' + g[0] + '">' + g[1] + '</button>';
       }).join('') + '</div>') +
       '</div>';
 
     /* 区间条（对齐参考图：当日/本月/近三月/近6月/今年/全部/自定义） */
     html += '<div class="nw-ranges nw-ranges-top">' + RANGES.map(function (r) {
       return '<button class="chip' + (r[0] === b.range ? ' active' : '') +
-        '" data-act="setNwRange" data-v="' + r[0] + '">' + r[1] + '</button>';
+        '" data-act="setNwRange" data-ns="' + ns + '" data-v="' + r[0] + '">' + r[1] + '</button>';
     }).join('') + '</div>';
 
     if (b.range === 'custom') {
       html += '<div class="field-row" style="margin:8px 0 2px">' +
         '<div class="field" style="margin:0"><label>开始日期</label>' +
-        '<input type="date" data-k="nwBeg" data-change="setNwCustom" value="' + U.esc(ui.nwBeg || '') + '"></div>' +
+        '<input type="date" data-k="nwBeg" data-ns="' + ns + '" data-change="setNwCustom" value="' + U.esc(beg) + '"></div>' +
         '<div class="field" style="margin:0"><label>结束日期</label>' +
-        '<input type="date" data-k="nwEnd" data-change="setNwCustom" value="' + U.esc(ui.nwEnd || '') + '"></div>' +
+        '<input type="date" data-k="nwEnd" data-ns="' + ns + '" data-change="setNwCustom" value="' + U.esc(end) + '"></div>' +
         '</div>';
     }
 
@@ -7434,27 +7473,27 @@ XJ.views.networth = (function () {
       }) }];
     }
 
-    /* ---- 指数图例（多选；无历史源 / 当日无分时的置灰并写明原因） ---- */
+    /* ---- 指数图例（多选） ----
+       只列出**有历史数据源**的指数；日经225 / 台湾加权 / 韩国KOSPI 没有可用的免费历史源，
+       整项不出现在图例里（不做假数据、也不占位置）。「当日」区间下没有分时的（美股指数）仍置灰说明。 */
     if (isPct) {
-      html += '<div class="nw-idx">' + MK.INDICES.map(function (d) {
+      var usableIdx = MK.INDICES.filter(function (d) { return MK.indexHasHistory(d.key); });
+      html += '<div class="nw-idx">' + usableIdx.map(function (d) {
         var on = (st.state.settings.indexCompare || []).indexOf(d.key) >= 0;
-        var why = '';
-        if (!MK.indexHasHistory(d.key)) why = d.unavailable || '暂无历史数据源';
-        else if (isToday && !MK.indexHasIntraday(d.key)) why = '当日无分时数据';
+        var why = (isToday && !MK.indexHasIntraday(d.key)) ? '当日无分时数据' : '';
         var usable = !why;
         return '<button class="nw-idxitem' + (on && usable ? ' on' : '') + (usable ? '' : ' off') +
           '" data-act="toggleIndex" data-v="' + d.key + '"' + (usable ? '' : ' disabled') +
           ' title="' + U.esc(usable ? d.name : d.name + '：' + why) + '">' +
           '<i style="background:' + (on && usable ? MK.indexColor(d.key) : '') + '"></i>' +
-          U.esc(d.name) + (usable ? ''
-            : '<em class="nw-idxno">' + (MK.indexHasHistory(d.key) ? '当日无分时' : '无数据') + '</em>') +
+          U.esc(d.name) + (usable ? '' : '<em class="nw-idxno">当日无分时</em>') +
           '</button>';
       }).join('') + '</div>';
       /* 曲线 / K 线切换 */
       html += '<div class="nw-modes">' +
         '<div class="segmented nw-seg">' + MODES.map(function (m) {
-          return '<button class="' + (m[0] === mode ? 'active' : '') + '" data-act="setNwMode" data-v="' +
-            m[0] + '">' + m[1] + '</button>';
+          return '<button class="' + (m[0] === mode ? 'active' : '') + '" data-act="setNwMode" data-ns="' + ns +
+            '" data-v="' + m[0] + '">' + m[1] + '</button>';
         }).join('') + '</div>' +
         '<div class="spacer" style="flex:1"></div>' +
         '<span class="tiny">' + (mode === 'candle' ? '蜡烛为选中指数' : '') + '</span>' +
@@ -7640,7 +7679,8 @@ XJ.views.networth = (function () {
     return out;
   }
 
-  return { render: render };
+  /* keyOf 导出给 app.js：动作处理器据此把控件写入对应实例（'' = 首页，'an' = 账户分析） */
+  return { render: render, keyOf: keyOf };
 })();
 
 
@@ -7652,7 +7692,7 @@ XJ.views.calendar = (function () {
   var TYPE_META = {
     register: { dot: 'register', color: 'var(--blue)', label: '股权登记日' },
     exdiv: { dot: 'exdiv', color: 'var(--up)', label: '除权除息日' },
-    payout: { dot: 'payout', color: 'var(--dividend)', label: '派息日' },
+    payout: { dot: 'payout', color: 'var(--payout)', label: '派息日' },
   };
 
   /* ---------------- 顶部切换 ---------------- */
@@ -7805,7 +7845,7 @@ XJ.views.calendar = (function () {
       '<div class="cal-legend">' +
       '<span><i style="background:var(--blue)"></i>股权登记</span>' +
       '<span><i style="background:var(--up)"></i>除权除息</span>' +
-      '<span><i style="background:var(--dividend)"></i>派息日</span>' +
+      '<span><i style="background:var(--payout)"></i>派息日</span>' +
       '</div>' +
       '<div class="note-line" style="justify-content:center;margin-top:12px">' +
       UI.icon('info', 13) +
@@ -8351,7 +8391,7 @@ XJ.views.mine = (function () {
     html += '<div class="card flush">' +
       '<button class="list-row" data-act="openAnalysis">' +
       '<div class="row-main"><div class="row-t">📊 账户分析</div>' +
-      '<div class="row-s">资产变动曲线 · 持仓盈亏榜 · 股息率分层 · 市场分布 · 集中度</div></div>' +
+      '<div class="row-s">资产走势曲线（市值/净资产/收益率） · 持仓盈亏榜 · 股息率分层 · 市场分布 · 集中度</div></div>' +
       '<span class="chev">' + UI.icon('chevron', 16) + '</span></button>' +
       '</div>';
 
@@ -8419,48 +8459,10 @@ XJ.views.analysis = (function () {
       (s.marketYield === null ? '—' : U.pct(s.marketYield)) + '</div><div class="s">预测分红/市值</div></div>' +
       '</div>';
 
-    /* ④ 资产变动曲线（同花顺风格：刻度 + 网格 + 拖动读数 + 区间切换） */
-    var RANGES = [['1m', '近1月', 30], ['3m', '近3月', 90], ['1y', '近1年', 365], ['all', '全部', 0]];
-    var curRange = st.ui.chartRange || '3m';
-    var rangeDef = RANGES.filter(function (r) { return r[0] === curRange; })[0] || RANGES[1];
-    var allSeries = XJ.calc.snapshotSeries(st.state, 0);
-    var series = XJ.calc.snapshotSeries(st.state, rangeDef[2]);
-
-    html += '<div class="section-title" style="display:flex;align-items:center;gap:8px">' +
-      '<span>资产变动</span><span style="flex:1"></span>' +
-      '<span class="tiny">按住图表可读数</span></div>';
-    html += '<div class="chips">' + RANGES.map(function (r) {
-      return '<button class="chip' + (r[0] === curRange ? ' active' : '') +
-        '" data-act="setChartRange" data-v="' + r[0] + '">' + r[1] + '</button>';
-    }).join('') + '</div>';
-
-    if (allSeries.length < 2) {
-      html += '<div class="card"><div class="empty" style="padding:20px 10px">' +
-        '<div class="ico">📈</div><h3>还没有足够的快照</h3>' +
-        '<p>系统会在每次同步后记录当天的资产快照，积累 2 天以上即可看到资产变动曲线。' +
-        (allSeries.length ? '<br>当前已有 1 条（' + U.esc(allSeries[0].date) + '）。' : '') +
-        '</p></div></div>';
-    } else if (series.length < 2) {
-      html += '<div class="card"><div class="tiny" style="text-align:center;padding:16px 0">' +
-        '所选区间内不足 2 个数据点，换个区间试试（共 ' + allSeries.length + ' 条快照）。</div></div>';
-    } else {
-      var firstV = series[0].mv;
-      var lastV = series[series.length - 1].mv;
-      var diff = lastV - firstV;
-      html += '<div class="card">' +
-        '<div style="display:flex;align-items:baseline;gap:9px;flex-wrap:wrap">' +
-        '<span style="font-size:21px;font-weight:700;letter-spacing:-.5px">¥' + U.moneyCompact(lastV) + '</span>' +
-        '<span class="tiny">较区间起点 <b class="' + U.dirClass(diff) + '">' + U.signMoney(diff, 0) + '</b>' +
-        (firstV > 0 ? ' <b class="' + U.dirClass(diff) + '">' + U.signPct(diff / firstV * 100) + '</b>' : '') +
-        '</span></div>' +
-        '<div class="tiny" style="margin:4px 0 8px">' + U.esc(series[0].date) + ' → ' +
-        U.esc(series[series.length - 1].date) + ' · ' + series.length + ' 个数据点</div>' +
-        XJ.chart.render(series) +
-        '<div class="note-line" style="margin-top:10px">' + UI.icon('info', 13) +
-        '<span>每次同步后记录一条当日快照（人民币口径），累计 ' + allSeries.length +
-        ' 条。按住图表拖动可查看任意一天的数值。</span></div>' +
-        '</div>';
-    }
+    /* ④ 资产走势（与首页同一张卡：持仓市值 / 净资产 / 收益率，区间/粒度/指数/收起齐全）
+       控件状态用独立实例（ns='an'），不会与首页那张互相影响。
+       它不依赖每日快照，直接由「交易流水还原持股数 × 历史收盘价」重建，所以新账户也能立刻看到曲线。 */
+    html += XJ.views.networth.render('an');
 
     /* ⑤⑥ 一组：盈亏榜 + 股息率分层（平板横屏并排） */
     html += '<div class="an-split">';
@@ -9410,9 +9412,7 @@ XJ.views.symbol = (function () {
     S.setUI({ sortMode: node.getAttribute('data-mode') });
   });
 
-  UI.on('setChartRange', function (node) {
-    S.setUI({ chartRange: node.getAttribute('data-v') });
-  });
+  /* 「资产变动」快照曲线已被账户分析里的「资产走势」卡取代，setChartRange 动作随之移除 */
 
   UI.on('setMarketFilter', function (node) {
     S.setUI({ marketFilter: node.getAttribute('data-key') });
@@ -10755,16 +10755,30 @@ XJ.views.symbol = (function () {
     S.setUI({ foldMineTx: !(S.ui.foldMineTx !== false) });
   });
 
-  /* ---------------- 资产走势：指标 / 区间 / 粒度 / 模式 / 收起 ---------------- */
+  /* ---------------- 资产走势：指标 / 区间 / 粒度 / 模式 / 收起 ----------------
+   * 这张卡挂了两处（首页 ns=''、账户分析 ns='an'），控件状态各自独立：
+   * 按钮上带 data-ns，这里统一换算成对应实例的 ui 键再写入。 */
+  function nwNs(node) {
+    return (node && node.getAttribute && node.getAttribute('data-ns')) || '';
+  }
+  function nwPatch(ns, kv) {
+    var out = {};
+    Object.keys(kv).forEach(function (field) {
+      out[XJ.views.networth.keyOf(ns, field)] = kv[field];
+    });
+    return out;
+  }
+
   UI.on('setNwMetric', function (node) {
+    var ns = nwNs(node);
     var v = node.getAttribute('data-v');
-    S.setUI({ nwMetric: (v === 'nw' || v === 'ret') ? v : 'mv' });
+    S.setUI(nwPatch(ns, { metric: (v === 'nw' || v === 'ret') ? v : 'mv' }));
     /* 切到收益率时，如果指数历史还没拉过就先拉一次 */
     if (v === 'ret') ensureIndexData(false);
   });
 
   UI.on('setNwMode', function (node) {
-    S.setUI({ nwMode: node.getAttribute('data-v') === 'candle' ? 'candle' : 'line' });
+    S.setUI(nwPatch(nwNs(node), { mode: node.getAttribute('data-v') === 'candle' ? 'candle' : 'line' }));
   });
 
   /** 勾选 / 取消对比指数 */
@@ -10806,34 +10820,38 @@ XJ.views.symbol = (function () {
     });
   });
 
-  UI.on('toggleNw', function () {
-    S.setUI({ nwCollapsed: !S.ui.nwCollapsed });
+  UI.on('toggleNw', function (node) {
+    var ns = nwNs(node);
+    var cur = S.ui[XJ.views.networth.keyOf(ns, 'collapsed')];
+    S.setUI(nwPatch(ns, { collapsed: !cur }));
   });
 
   UI.on('setNwGran', function (node) {
-    S.setUI({ nwGran: node.getAttribute('data-v') === 'month' ? 'month' : 'day' });
+    S.setUI(nwPatch(nwNs(node), { gran: node.getAttribute('data-v') === 'month' ? 'month' : 'day' }));
   });
 
   UI.on('setNwRange', function (node) {
+    var ns = nwNs(node);
     var v = node.getAttribute('data-v') || 'all';
-    var patch = { nwRange: v };
-    if (v === 'custom' && !S.ui.nwBeg) {
+    var patch = { range: v };
+    if (v === 'custom' && !S.ui[XJ.views.networth.keyOf(ns, 'beg')]) {
       var t = U.today();
-      patch.nwBeg = U.addDays(t, -90);
-      patch.nwEnd = t;
+      patch.beg = U.addDays(t, -90);
+      patch.end = t;
     }
-    S.setUI(patch);
+    S.setUI(nwPatch(ns, patch));
   });
 
   UI.on('setNwCustom', function (node) {
-    var sheet = node.closest('#view-body') || document;
-    var beg = sheet.querySelector('[data-k="nwBeg"]');
-    var end = sheet.querySelector('[data-k="nwEnd"]');
-    S.setUI({
-      nwRange: 'custom',
-      nwBeg: beg ? beg.value : S.ui.nwBeg,
-      nwEnd: end ? end.value : S.ui.nwEnd,
-    });
+    var ns = nwNs(node);
+    var card = (node.closest && node.closest('.nw-card')) || document;
+    var beg = card.querySelector('[data-k="nwBeg"]');
+    var end = card.querySelector('[data-k="nwEnd"]');
+    S.setUI(nwPatch(ns, {
+      range: 'custom',
+      beg: beg ? beg.value : S.ui[XJ.views.networth.keyOf(ns, 'beg')],
+      end: end ? end.value : S.ui[XJ.views.networth.keyOf(ns, 'end')],
+    }));
   });
 
   UI.on('fetchHistory', function () {
