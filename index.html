@@ -538,8 +538,21 @@ table.tbl tbody tr:active{ background:var(--card-2); }
 .hc-name{ font-size:15.5px; font-weight:650; letter-spacing:-.2px; display:flex; align-items:center; gap:5px; }
 .hc-name .nm{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 /* 第二行：代码 + 涨跌幅徽章（徽章从名字行下移到这里，腾出整行给名字） */
-.hc-code{ display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--text-3); margin-top:3px; }
-.hc-code .chg{ font-size:10.5px; padding:1px 6px; border-radius:5px; }
+.hc-code{ display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--text-3); margin-top:3px; min-width:0; }
+.hc-code .chg{ font-size:10.5px; padding:1px 6px; border-radius:5px; flex:0 0 auto; }
+
+/* 技术信号标记（BOLL 下轨 + KDJ 的 J<0）
+   文案是中性指标描述，不构成投资建议。
+   日线下轨 = 绿（--down，与中国「跌」同色）；周线下轨 = 红（--up）。
+   窄屏下允许收缩并省略号截断，避免把代码与涨跌徽章挤出卡片。 */
+.hc-sig{
+  flex:0 1 auto; min-width:0;
+  font-size:10px; font-weight:600; line-height:1.35;
+  padding:1px 5px; border-radius:5px; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis;
+}
+.hc-sig.sig-day{ color:var(--down); background:rgba(18,161,80,.10); }
+.hc-sig.sig-week{ color:var(--up); background:rgba(224,49,47,.10); }
 .hc-right{ text-align:right; flex:0 0 auto; }
 .hc-div{ font-size:19px; font-weight:730; letter-spacing:-.5px; color:var(--dividend); font-variant-numeric:tabular-nums; }
 .hc-div-lbl{ font-size:10.5px; color:var(--text-3); margin-top:1px; }
@@ -758,8 +771,17 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   display:flex; align-items:center; gap:10px;
   margin-top:10px; padding-top:9px; border-top:.5px solid var(--line-2);
 }
-.hc-spark{ flex:1; min-width:0; height:34px; }
+/* 分时图限宽：sparkline 的 SVG 用了 preserveAspectRatio="none"（只横向拉伸、纵向恒定），
+   容器有多宽曲线就摊多宽 —— 单列宽卡片里会被拉到 5~8 倍，走势形态完全失真。
+   统一用 flex:1 1 auto + max-width:380px 封顶。380px 是实测出来的单档最优解：
+   它只在「卡片可用宽度 > 380px」时才起作用，恰好覆盖 576/668/490/528px 这几个
+   拉伸最凶的场景（拉到 3.8×），而手机单列（可用 217~323px）根本够不着，无需另设断点。
+   曾试过给 ≤640px 写 max-width:none，结果 600px 视口反而恶化到 5.11×，故废弃。
+   注意不能写 flex:1（= 1 1 0%），基准 0 配 max-width 会在中等宽度下过度收缩。 */
+.hc-spark{ flex:1 1 auto; min-width:0; max-width:380px; height:34px; }
 .hc-spark svg{ display:block; width:100%; height:34px; }
+/* 限宽后曲线左侧留白，把价格块推到卡片右缘，避免中间出现一段突兀的空白 */
+.hc-intra .hc-px{ margin-left:auto; }
 .hc-px{
   flex:0 0 auto; text-align:right; display:flex; flex-direction:column;
   align-items:flex-end; gap:1px; line-height:1.2;
@@ -912,6 +934,9 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   .metric .v{ font-size:21px; }
   .nw-amount{ font-size:27px; }
   .nw-chart{ max-width:620px; }
+  /* 两列布局：单卡实测 358~424px，减去内边距与价格块（31~49px）后可用约 270~340px。
+     基准的 380px 在这里够不着（本来就被 flex 收缩到可用宽度），所以不必再写 —— 保留本档
+     不做覆盖，让曲线占满可用余量。 */
   .hold-list{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
   .hold-list .hold-card{ margin-bottom:0; }
   .cal-cell{ min-height:62px; }
@@ -955,6 +980,8 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   .hc-cell .v{ font-size:12px; }
   .hc-intra{ margin-top:8px; padding-top:8px; }
   .hc-spark, .hc-spark svg{ height:30px; }
+  /* 手机单列：卡 296~406px，减内边距与价格块后可用约 217~323px。
+     基准 380px 在这里够不着，无需覆盖。 */
   .nw-amount{ font-size:22px; letter-spacing:-.7px; }
   .nw-mini-v{ font-size:17px; }
   .nw-ctrls{ gap:6px; margin:10px 0 2px; }
@@ -988,6 +1015,9 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   .hc-div{ font-size:16.5px; }
   .hc-code{ font-size:10.5px; gap:4px; }
   .hc-code .chg{ font-size:9.5px; padding:1px 4px; }
+  /* 技术信号在极窄屏进一步缩字号；必要时由 .hc-sig 的 ellipsis 兜底，
+     优先级让给代码与涨跌幅徽章（信号只是附加信息） */
+  .hc-sig{ font-size:9px; padding:1px 4px; }
 }
 
 </style>
@@ -1961,6 +1991,7 @@ XJ.model = (function () {
       snapshots: {},        // 'YYYY-MM-DD' -> { mv, cost, pred, recv, fx }
       priceHistory: {},     // symbol -> { at:'YYYY-MM-DD', points:[['YYYY-MM-DD', price], ...] }
       indexHistory: {},     // indexKey -> { at:'YYYY-MM-DD', bars:[['YYYY-MM-DD', o, h, l, c], ...] }
+      klineCache: {},       // symbol -> { at:'YYYY-MM-DD', day:[{d,o,h,l,c}], week:[...] }（技术信号用）
     };
   }
 
@@ -2020,6 +2051,10 @@ XJ.model = (function () {
     if (!state.priceHistory || typeof state.priceHistory !== 'object') state.priceHistory = {};
     // v4 新增容器
     if (!state.indexHistory || typeof state.indexHistory !== 'object') state.indexHistory = {};
+    /* 技术信号用的 OHLC K 线缓存：symbol -> { at:'YYYY-MM-DD', day:[{d,o,h,l,c}], week:[...] }
+       与 priceHistory 分开存：那套只有收盘价、算不了 BOLL/KDJ，
+       而且两者的刷新策略不同（K 线按天缓存，净值曲线按需重取）。 */
+    if (!state.klineCache || typeof state.klineCache !== 'object') state.klineCache = {};
     if (!state.settings) state.settings = {};
     if (!Array.isArray(state.settings.indexCompare)) {
       state.settings.indexCompare = ['sh', 'hs300', 'hsi'];
@@ -2137,6 +2172,7 @@ XJ.model = (function () {
       quoteCache: state.quoteCache,
       priceHistory: state.priceHistory,
       indexHistory: state.indexHistory,
+      klineCache: state.klineCache,
     };
   }
 
@@ -2157,6 +2193,7 @@ XJ.model = (function () {
     if (raw.quoteCache && typeof raw.quoteCache === 'object') out.quoteCache = raw.quoteCache;
     if (raw.priceHistory && typeof raw.priceHistory === 'object') out.priceHistory = raw.priceHistory;
     if (raw.indexHistory && typeof raw.indexHistory === 'object') out.indexHistory = raw.indexHistory;
+    if (raw.klineCache && typeof raw.klineCache === 'object') out.klineCache = raw.klineCache;
     if (raw.version) out.version = raw.version;
 
     return ensureBootstrapped(out);
@@ -3863,7 +3900,93 @@ XJ.fetcher = (function () {
     return step();
   }
 
-  /** 指数当日分时（腾讯分时接口，仅 A股/港股指数有） */
+  /* ---------------- 技术信号用：带 OHLC 的日K / 周K ----------------
+   * 与上面 fetchKline（只要收盘价、画净值曲线）分开：技术信号要算 BOLL / KDJ，
+   * 必须有【最高价、最低价】，所以单开一条通道，互不影响原有缓存结构。
+   *
+   * 复用腾讯 fqkline（与 fetchKline 同一个端点），但：
+   *   - 周期可传 day / week / month（接口原生支持，不必自己聚合）
+   *   - 解析出完整 OHLC
+   * ⚠️ 字段序是 [日期, 开, 收, 高, 低, 量] —— 第 3 列是【收】不是【高】。
+   *    这与常见的 OHLC 顺序不同，写错不会报错、只会让指标静默算歪。
+   */
+
+  /** 纯解析：腾讯 fqkline payload → [{d,o,h,l,c}]（升序） */
+  function parseKlineBars(payload, symbol) {
+    var node = payload && payload.data && payload.data[symbol];
+    if (!node) return [];
+    var rows = node.day || node.qfqday || node.hfqday ||
+               node.week || node.qfqweek || node.month || node.qfqmonth;
+    if (!rows || !rows.length) return [];
+    var out = [];
+    rows.forEach(function (r) {
+      if (!r || r.length < 5) return;
+      var d = String(r[0]).slice(0, 10);
+      var o = U.num(r[1]), c = U.num(r[2]), h = U.num(r[3]), l = U.num(r[4]);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+      if (o === null || c === null || h === null || l === null) return;
+      if (o <= 0 || c <= 0 || h <= 0 || l <= 0) return;
+      out.push({ d: d, o: o, h: h, l: l, c: c });
+    });
+    out.sort(function (a, b) { return a.d < b.d ? -1 : a.d > b.d ? 1 : 0; });
+    return out;
+  }
+
+  /**
+   * 取单只标的指定周期的 OHLC K 线。
+   * @param sym  内部代码，如 sh600036
+   * @param period 'day' | 'week' | 'month'
+   * @param count 根数（默认 60，够 KDJ 的 K/D 从初值 50 收敛）
+   * @param codeOverride 美股必须带交易所后缀（复用 fetchPriceHistory 的口径）
+   */
+  function fetchKlineBars(sym, period, count, codeOverride) {
+    var varName = 'xjkb_' + (++cbSeq) + '_' + Date.now().toString(36);
+    var code = codeOverride ? XJ.market.marketOf(sym) + codeOverride : sym;
+    var p = period === 'week' ? 'week' : (period === 'month' ? 'month' : 'day');
+    var url = KLINE_URL + code + ',' + p + ',,,' + (count || 60) + ',&_var=' + varName;
+    return new Promise(function (resolve) {
+      loadScript(url, null, PLAN_TIMEOUT, function () {
+        var bars = parseKlineBars(window[varName], code);
+        try { delete window[varName]; } catch (e) { window[varName] = undefined; }
+        resolve(bars);
+      });
+    }).catch(function () { return []; });
+  }
+
+  /**
+   * 批量取「日K + 周K」两套 OHLC。返回 { symbol: { day: [...], week: [...] } }
+   * 串行 + 间隔，避免被限流；单只失败不影响其它。
+   * 场外基金（of）没有盘中 K 线，直接跳过。
+   */
+  function fetchKlineBundle(symbols, opts) {
+    opts = opts || {};
+    var list = (symbols || []).filter(function (s, i, a) {
+      return s && a.indexOf(s) === i && XJ.market.assetType(s) !== 'of';
+    });
+    if (!list.length) return Promise.resolve({});
+    var count = opts.count || 60;
+    var codes = opts.codes || {};
+    var out = {};
+    var i = 0;
+    function step() {
+      if (i >= list.length) return Promise.resolve(out);
+      var sym = list[i++];
+      return fetchKlineBars(sym, 'day', count, codes[sym]).then(function (day) {
+        /* 日K 拿不到就没有任何指标可算，不必再请求周K */
+        if (!day || !day.length) return null;
+        return fetchKlineBars(sym, 'week', count, codes[sym]).then(function (week) {
+          out[sym] = { day: day, week: week || [] };
+          return null;
+        });
+      }).then(function () {
+        if (onHistoryTick) onHistoryTick(i, list.length, sym);
+        if (i >= list.length) return out;
+        return new Promise(function (r) { setTimeout(r, 150); }).then(step);
+      });
+    }
+    return step();
+  }
+
   function fetchIndexMinutes(keys) {
     var list = (keys || []).filter(function (k) {
       var d = XJ.market.indexDef(k);
@@ -3953,6 +4076,9 @@ XJ.fetcher = (function () {
     parseTrends: parseTrends,
     fetchPriceHistory: fetchPriceHistory,
     parseKline: parseKline,
+    parseKlineBars: parseKlineBars,
+    fetchKlineBars: fetchKlineBars,
+    fetchKlineBundle: fetchKlineBundle,
     parseFundNav: parseFundNav,
     setHistoryProgress: setHistoryProgress,
     fetchIndexHistory: fetchIndexHistory,
@@ -6403,8 +6529,448 @@ XJ.calc = (function () {
     return out;
   }
 
+  /* ==================== 技术信号：BOLL 布林带 + KDJ ====================
+   * 只做指标计算与「是否触及下轨」的客观判定，不含任何操作建议 ——
+   * 项目红线是「只做记录、不荐股」，故文案与函数名一律使用中性描述。
+   */
+
+  /* 指标参数集中在这里，便于日后用行情软件实测校准。
+     BOLL(20, 2)：中轨 = MA20，上下轨 = 中轨 ± 2 × 标准差（总体口径）
+     KDJ(9, 3, 3)：RSV 取 9 日；K、D 各 3 日平滑；J = 3K − 2D */
+  var SIG_BOLL_N = 20, SIG_BOLL_K = 2;
+  var SIG_KDJ_N = 9, SIG_KDJ_M1 = 3, SIG_KDJ_M2 = 3;
+  /* KDJ 的 K、D 初值（通达信口径取 50）。
+     初值的影响不会立刻消失 —— 所以要喂足够长（≥3×N）的历史让 K/D 收敛，
+     缓存之所以取 60 根而不是刚好 20 根，就是为了这个。 */
+  var SIG_KDJ_INIT = 50;
+  /* 信号所需的最少有效根数（窗口不足时无值可判，一律不亮） */
+  var SIG_MIN_BARS = SIG_BOLL_N;
+
+  var SIG_DAY = { kind: 'day', text: '日线下轨', cls: 'sig-day' };
+  var SIG_WEEK = { kind: 'week', text: '周线下轨', cls: 'sig-week' };
+
+  /**
+   * 滑动窗口均值。
+   * 窗口不足的位置返回 null（而不是拿不完整的窗口凑一个数）——
+   * 这样 BOLL 的起点与主流行情软件一致：第 N 根才开始有值。
+   * @param {number[]} arr
+   * @param {number} n 窗口长度
+   * @return {(number|null)[]} 与 arr 等长
+   */
+  function smaSeries(arr, n) {
+    var src = arr || [];
+    n = n || 1;
+    var out = [], sum = 0;
+    for (var i = 0; i < src.length; i++) {
+      sum += src[i];
+      if (i >= n) sum -= src[i - n];
+      out.push(i >= n - 1 ? sum / n : null);
+    }
+    return out;
+  }
+
+  /**
+   * 滑动窗口【总体】标准差（除以 N，不是样本口径的 N−1）。
+   * 口径必须固定为总体：样本口径会让下轨偏低约 2.6%，
+   * 而本功能恰恰是在「价格贴着下轨」的临界场景下做判定，这点偏差足以翻转结论。
+   * @param {number[]} arr
+   * @param {number} n
+   * @return {(number|null)[]}
+   */
+  function stdSeries(arr, n) {
+    var src = arr || [];
+    n = n || 1;
+    var out = [];
+    for (var i = 0; i < src.length; i++) {
+      if (i < n - 1) { out.push(null); continue; }
+      var mean = 0, k;
+      for (k = i - n + 1; k <= i; k++) mean += src[k];
+      mean /= n;
+      var v = 0;
+      for (k = i - n + 1; k <= i; k++) v += (src[k] - mean) * (src[k] - mean);
+      out.push(Math.sqrt(v / n));
+    }
+    return out;
+  }
+
+  /**
+   * 布林带 BOLL(N, K)：中轨 = MA(N)，上/下轨 = 中轨 ± K × 标准差。
+   * 返回【全序列】而非只返回最后一根 —— 单测可以逐根断言，
+   * 也便于日后画图回看；调用方取末项即可。
+   * @param {number[]} closes 收盘价序列（升序）
+   * @param {number} n 周期，默认 20
+   * @param {number} k 倍数，默认 2
+   * @return {{ mid:number, upper:number, lower:number, i:number }[]}
+   *   长度与 closes 相同；窗口不足的位置三个值均为 null
+   */
+  function boll(closes, n, k) {
+    n = n || SIG_BOLL_N;
+    k = (k === undefined || k === null) ? SIG_BOLL_K : k;
+    var src = [], raw = closes || [];
+    for (var i = 0; i < raw.length; i++) {
+      var v = U.num(raw[i]);
+      /* 脏值兜底为 0，避免 NaN 顺着窗口扩散；调用方负责先剔除无效根 */
+      src.push(v === null ? 0 : v);
+    }
+    if (!src.length) return [];
+    var mid = smaSeries(src, n), sd = stdSeries(src, n);
+    var out = [];
+    for (var j = 0; j < src.length; j++) {
+      if (mid[j] === null || sd[j] === null) {
+        out.push({ mid: null, upper: null, lower: null, i: j });
+      } else {
+        out.push({
+          mid: mid[j],
+          upper: mid[j] + k * sd[j],
+          lower: mid[j] - k * sd[j],
+          i: j,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * KDJ(N, M1, M2)：
+   *   RSV = (C − N 日内最低) / (N 日内最高 − N 日内最低) × 100
+   *   K = (M1−1)/M1 × 前K + 1/M1 × RSV      （M1=3 即 K = 2/3·前K + 1/3·RSV）
+   *   D = (M2−1)/M2 × 前D + 1/M2 × K
+   *   J = 3K − 2D
+   * J 的取值【不设上下限】—— 超出 0~100 是 KDJ 的固有性质，
+   * 本功能的判定条件正是 J < 0，clamp 会把信号彻底改掉。
+   * @param {{h:number,l:number,c:number}[]} bars 含高/低/收的 K 线（升序）
+   * @param {number} n 默认 9
+   * @param {number} m1 默认 3
+   * @param {number} m2 默认 3
+   * @return {{k:number,d:number,j:number,i:number}[]} 长度与 bars 相同；不足 N 根处为 null
+   */
+  function kdj(bars, n, m1, m2) {
+    n = n || SIG_KDJ_N; m1 = m1 || SIG_KDJ_M1; m2 = m2 || SIG_KDJ_M2;
+    var list = bars || [];
+    if (!list.length) return [];
+    var out = [];
+    var pk = SIG_KDJ_INIT, pd = SIG_KDJ_INIT;
+    for (var i = 0; i < list.length; i++) {
+      if (i < n - 1) { out.push({ k: null, d: null, j: null, i: i }); continue; }
+      var hh = -Infinity, ll = Infinity, ok = true;
+      for (var k = i - n + 1; k <= i; k++) {
+        var b = list[k] || {};
+        var h = U.num(b.h), l = U.num(b.l);
+        if (h === null || l === null) { ok = false; break; }
+        if (h > hh) hh = h;
+        if (l < ll) ll = l;
+      }
+      var c = U.num((list[i] || {}).c);
+      if (!ok || c === null) { out.push({ k: null, d: null, j: null, i: i }); continue; }
+      /* N 日最高 === 最低（一字板、停牌横盘、数据源只给一个价）时分母为 0。
+         取中性值 50：RSV 一旦变成 NaN，J 就是 NaN，而 `NaN < 0` 恒为 false
+         —— 信号会静默地永不亮起，极难排查，故必须在这里兜住。 */
+      var rsv = (hh === ll) ? SIG_KDJ_INIT : (c - ll) / (hh - ll) * 100;
+      pk = (m1 - 1) / m1 * pk + 1 / m1 * rsv;
+      pd = (m2 - 1) / m2 * pd + 1 / m2 * pk;
+      out.push({ k: pk, d: pd, j: 3 * pk - 2 * pd, i: i });
+    }
+    return out;
+  }
+
+  /** 本周一（'YYYY-MM-DD'）；today 非法时原样返回（退化为「不过滤」） */
+  function mondayOf(today) {
+    var t = U.parseYmd(today);
+    if (!t) return today;
+    var dow = t.getDay();                    // 0 = 周日
+    var back = dow === 0 ? 6 : dow - 1;
+    return U.addDays(today, -back) || today;
+  }
+
+  /**
+   * 把「已收盘的历史 K 线」与「今日实时那根」拼成一条连续序列。
+   *
+   * ★ 实测（2026-09-16，腾讯 fqkline，5 标的交叉验证）：
+   *   接口盘中给的「今日那根」就是实时根，其 o/h/l/c 与行情接口逐位一致：
+   *     招商银行  末根 高41.41 低40.52  ←→  行情 qt[33] 41.41 / qt[34] 40.52   ✅
+   *     五粮液    末根 高69.69 低68.89  ←→  行情 69.69 / 68.89                 ✅
+   *   即：**不是「尚未收盘的旧值」，更不是只有现价**。
+   *   所以当接口已给今日根时【原样采用】，保留真实的盘中最高/最低。
+   *
+   * 为什么不能一律「开=高=低=收=现价」：
+   *   那样会让今日根的 h−l = 0，把布林带的 σ 系统性压低
+   *   （招商银行 40.95 / 41.41 / 40.52 的日振幅 1.07% 被抹成 0），
+   *   而下轨 = 中轨 − 2σ 恰恰是本功能的判定依据 —— σ 偏小则下轨偏高，信号会偏晚。
+   *
+   * 回退（接口未给今日根时，如早盘开盘前、或数据源当日缺根）：
+   *   退化为「开=高=低=收=现价」，仍参与计算，保证信号不整段消失。
+   *   verify【30】锁定了这条回退路径。
+   *
+   * @param {{d,o,h,l,c}[]} bars 历史 K 线（升序，【可含】今日那根）
+   * @param {string} today 'YYYY-MM-DD'
+   * @param {number} price 实时价（用于回退，以及校正今日根的收盘）
+   * @return {{d,o,h,l,c,live?}[]} 新数组（不修改入参）
+   */
+  function withLiveBar(bars, today, price) {
+    var list = bars || [], out = [];
+    var p = U.num(price);
+    var todayBar = null;
+
+    for (var i = 0; i < list.length; i++) {
+      var b = list[i];
+      if (!b || !b.d) continue;
+      if (b.d > today) continue;               // 未来根一律丢弃（脏数据）
+      if (b.d === today) { todayBar = b; continue; }   // 今日根另作处理
+      out.push({ d: b.d, o: b.o, h: b.h, l: b.l, c: b.c });
+    }
+
+    if (todayBar) {
+      /* 接口已给今日根：原样采用真实 o/h/l/c。
+         唯一校正：收盘价用实时价（接口可能给的是若干秒前的快照，
+         而信号判定用的 p 就是当下现价，两者必须一致，否则会出现
+         「按接口收价判命中、按现价判不命中」的自相矛盾）。 */
+      var h = U.num(todayBar.h), l = U.num(todayBar.l), o = U.num(todayBar.o);
+      if (p !== null && p > 0) {
+        if (h === null || p > h) h = p;
+        if (l === null || p < l) l = p;
+        if (o === null) o = p;
+        out.push({ d: today, o: o, h: h, l: l, c: p, live: true });
+      } else {
+        out.push({ d: today, o: o, h: h, l: l, c: U.num(todayBar.c), live: true });
+      }
+    } else {
+      /* 接口未给今日根 → 回退：开=高=低=收=现价 */
+      if (p === null || p <= 0) return out;
+      out.push({ d: today, o: p, h: p, l: p, c: p, live: true });
+    }
+    return out;
+  }
+
+  /**
+   * 由【日 K】聚合出【本周那根未收盘周 K】—— **回退路径**。
+   *
+   * ★ 实测（2026-09-16）：腾讯周 K 接口盘中给的「本周那根」日期就是今天、
+   *   收价 = 现价，且 开/高/低 与「本周日K聚合」的结果**逐位一致**：
+   *     招商银行  接口 开41.34 高41.83 低40.52  ←→  聚合 41.34 / 41.83 / 40.52  ✅
+   *     五粮液    接口 开69.76 高70.00 低68.89  ←→  聚合 69.76 / 70.00 / 68.89  ✅
+   *   所以主路径**优先用接口那根**（口径与行情软件一致，且少一次聚合计算）。
+   *
+   * 本函数仅在接口没给「本周那根」时兜底 —— 最典型的是**周一早盘**：
+   * 此时接口可能还没生成本周的周 K，若不兜底则在聚合结果之外，
+   * 整个上午的周线信号都会消失。反推：接口给的是「上周五收盘」那根，
+   * 与现价脱节，也不能直接用（否则信号半天不动）。
+   *
+   * 兜底口径：
+   *   开 = 本周第一根日 K 的开盘价
+   *   高 = 本周所有日 K 的最高价 ∪ 现价
+   *   低 = 本周所有日 K 的最低价 ∪ 现价
+   *   收 = 现价
+   *
+   * @param {{d,o,h,l,c}[]} dayBars 日 K（升序，含今日）
+   * @param {string} today 'YYYY-MM-DD'
+   * @param {number} price 实时价
+   * @return {{d,o,h,l,c,live}|null} today 非法或现价无效时返回 null
+   */
+  function weekLiveBar(dayBars, today, price) {
+    var p = U.num(price);
+    if (p === null || p <= 0) return null;
+    var mon = mondayOf(today);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(mon)) return null;
+
+    var o = null, h = null, l = null;
+    var list = dayBars || [];
+    for (var i = 0; i < list.length; i++) {
+      var b = list[i];
+      if (!b || !b.d) continue;
+      if (b.d < mon || b.d > today) continue;      // 只吃本周一 → 今天
+      if (o === null) o = U.num(b.o);
+      var bh = U.num(b.h), bl = U.num(b.l);
+      if (bh !== null && (h === null || bh > h)) h = bh;
+      if (bl !== null && (l === null || bl < l)) l = bl;
+    }
+    if (h === null || h < p) h = p;
+    if (l === null || l > p) l = p;
+    if (o === null) o = p;
+    return { d: today, o: o, h: h, l: l, c: p, live: true };
+  }
+
+  /**
+   * 拼出「实时周 K 序列」：历史周 K + 本周那根（优先接口，缺失则聚合兜底）。
+   *
+   * 拆成独立纯函数是为了让单测能直接断言这条**优先级链**，
+   * 而不必去构造完整的 day/week 缓存。
+   *
+   * @param {{d,o,h,l,c}[]} weekBars 接口周 K（升序，【可含】本周那根）
+   * @param {{d,o,h,l,c}[]} dayBars 日 K（升序，含今日；仅兜底时用到）
+   * @param {string} today 'YYYY-MM-DD'
+   * @param {number} price 实时价
+   * @return {{d,o,h,l,c,live?}[]}
+   */
+  function withLiveWeek(weekBars, dayBars, today, price) {
+    var mon = mondayOf(today);
+    var p = U.num(price);
+    var out = [], hasThisWeek = false;
+    var wk = weekBars || [];
+
+    for (var i = 0; i < wk.length; i++) {
+      var b = wk[i];
+      if (!b || !b.d) continue;
+      if (b.d > today) continue;              // 未来根丢弃
+      if (b.d >= mon) { hasThisWeek = true; } // 本周那根（d 在 [周一, 今天] 区间内）
+      out.push({ d: b.d, o: b.o, h: b.h, l: b.l, c: b.c });
+    }
+
+    if (hasThisWeek) {
+      /* 主路径：接口已给本周那根。只把收盘校正为实时价，
+         高/低保留接口的真实盘中极值。 */
+      var last = out[out.length - 1];
+      if (p !== null && p > 0) {
+        var h = U.num(last.h), l = U.num(last.l);
+        if (h === null || p > h) h = p;
+        if (l === null || p < l) l = p;
+        last.h = h; last.l = l; last.c = p; last.live = true;
+      }
+    } else {
+      /* 回退路径：接口没给本周那根（典型：周一早盘）→ 由本周日 K 聚合 */
+      var wlb = weekLiveBar(dayBars, today, p);
+      if (wlb) out.push(wlb);
+    }
+    return out;
+  }
+
+  /**
+   * 技术信号的统一入口 —— 优先级也收敛在这里，视图层只负责展示。
+   *
+   * 判定（用户口径，不得擅改）：
+   *   日线：现价 ≤ 日线实时布林下轨 且 日线实时 KDJ 的 J < 0
+   *   周线：现价 ≤ 周线实时布林下轨 且 周线实时 KDJ 的 J < 0
+   *   两者同时成立 → 只返回周线（周线权重更高）
+   * 「触及」含【等于】（用 ≤ 而非 <）。
+   * 条件不满足即返回 null，视图据此立刻不渲染 —— 天然满足「不再满足就立即消失」。
+   *
+   * 「实时」的含义（2026-09-16 实测后定稿）：
+   *   日线 = 历史日 K + 今日那根（**原样采用接口给的实时 o/h/l/c**，
+   *          保留真实盘中最高/最低；接口缺今日根时才退化为「开=高=低=收=现价」）
+   *   周线 = 历史周 K + 本周那根（**优先用接口给的实时那根**；
+   *          接口缺本周根时才由本周日 K 聚合）
+   *   收盘价一律校正为传入的实时价 p，与判定所用的 p 保持同源。
+   *
+   * @param {string} symbol 标的
+   * @param {{d,o,h,l,c}[]} dayBars 日 K 缓存（可含今日那根）
+   * @param {{d,o,h,l,c}[]} weekBars 周 K 缓存（可含本周那根）
+   * @param {number} price 实时价
+   * @param {string} today 'YYYY-MM-DD'
+   * @return {null|{kind:'day'|'week', text:string, cls:string}}
+   */
+  function bollSignal(symbol, dayBars, weekBars, price, today) {
+    var p = U.num(price);
+    if (p === null || p <= 0) return null;
+
+    /* 场外基金没有盘中行情，单位净值本身就是收盘价，
+       「实时价格触及下轨」无从谈起 —— 直接不参与，而不是拿净值硬凑一个信号。 */
+    if (XJ.market.assetType(symbol) === 'of') return null;
+
+    var dayHit = false, weekHit = false;
+
+    /* ---- 日线 ---- */
+    var live = withLiveBar(dayBars, today, p);
+    if (live.length >= SIG_MIN_BARS) {
+      var closes = live.map(function (b) { return b.c; });
+      var bb = boll(closes, SIG_BOLL_N, SIG_BOLL_K);
+      var lastB = bb.length ? bb[bb.length - 1] : null;
+      var kk = kdj(live, SIG_KDJ_N, SIG_KDJ_M1, SIG_KDJ_M2);
+      var lastK = kk.length ? kk[kk.length - 1] : null;
+      if (lastB && lastB.lower !== null && lastK && lastK.j !== null) {
+        dayHit = (p <= lastB.lower) && (lastK.j < 0);
+      }
+    }
+
+    /* ---- 周线 ---- */
+    var wlive = withLiveWeek(weekBars, dayBars, today, p);
+    if (wlive.length >= SIG_MIN_BARS) {
+      var wcloses = wlive.map(function (b) { return b.c; });
+      var wbb = boll(wcloses, SIG_BOLL_N, SIG_BOLL_K);
+      var wlastB = wbb.length ? wbb[wbb.length - 1] : null;
+      var wkk = kdj(wlive, SIG_KDJ_N, SIG_KDJ_M1, SIG_KDJ_M2);
+      var wlastK = wkk.length ? wkk[wkk.length - 1] : null;
+      if (wlastB && wlastB.lower !== null && wlastK && wlastK.j !== null) {
+        weekHit = (p <= wlastB.lower) && (wlastK.j < 0);
+      }
+    }
+
+    if (weekHit) return { kind: SIG_WEEK.kind, text: SIG_WEEK.text, cls: SIG_WEEK.cls };
+    if (dayHit) return { kind: SIG_DAY.kind, text: SIG_DAY.text, cls: SIG_DAY.cls };
+    return null;
+  }
+
+  /**
+   * 把多只标的的「当日分时」按【时间戳】对齐后累加成组合市值序列。
+   *
+   * 为什么必须按时间戳而不是按下标：
+   *   各标的的分时点数天然不同（停牌、新上市、数据源返回条数、美股点数完全不同），
+   *   用数组下标对齐等于假设「第 i 个点就是同一时刻」，一旦某标的缺某个时刻，
+   *   它的贡献会整段消失，算出来的组合值出现台阶式下跌，极端情况直接算出 -100%。
+   *
+   * 时间轴取所有标的时间戳的【有序并集】；某标的在某时刻没有数据时用【前值填充】
+   * （沿用它在该时刻之前最后一个有效价格），而不是跳过 —— 跳过正是造成台阶跳水的直接原因。
+   *
+   * @param {Array} holdings  [{ symbol, qty, currency }]
+   * @param {Object} minutes  { [symbol]: { points: [{ t:'09:30', p:16.2 }] } }
+   * @param {Function} rateFn 币种 → 汇率（可选，默认恒为 1）
+   * @return {{ points: [{ t, mv, filled }], missing: [symbol] }}
+   *   points[].mv     = 该时刻 Σ(持股数 × 价格 × 汇率)
+   *   points[].filled = 该时刻有多少只标的用了前值填充（供调试与断言）
+   *   missing         = 完全没有可用分时数据的标的
+   */
+  function alignMinute(holdings, minutes, rateFn) {
+    var rate = typeof rateFn === 'function' ? rateFn : function () { return 1; };
+    var hs = (holdings || []).filter(function (h) {
+      return h && h.symbol && U.num(h.qty) !== null;
+    });
+    var mins = minutes || {};
+
+    /* 每只标的：points 转成按时间升序的数组（数据源本就升序，这里保守排一次），
+       并记录它的第一个有效时刻，便于后续「从头就没有数据」的判定 */
+    var series = [], missing = [], tset = {};
+    hs.forEach(function (h) {
+      var m = mins[h.symbol];
+      var pts = (m && m.points) ? m.points.filter(function (p) {
+        return p && p.t && U.num(p.p) !== null;
+      }) : [];
+      if (pts.length < 2) { missing.push(h.symbol); return; }
+      pts = pts.slice().sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
+      pts.forEach(function (p) { tset[p.t] = 1; });
+      series.push({ symbol: h.symbol, qty: U.num(h.qty), rate: U.num(rate(h.currency)) || 1, pts: pts });
+    });
+    if (!series.length) return { points: [], missing: missing };
+
+    /* "HH:MM" 的字典序即时间序 */
+    var times = Object.keys(tset).sort();
+
+    var out = [];
+    var cursor = {};      // symbol → 已推进到的下标（指针推进，避免 O(n²) 查找）
+    var lastPrice = {};   // symbol → 最后一个有效价格（前值填充用）
+    series.forEach(function (s) { cursor[s.symbol] = -1; });
+
+    times.forEach(function (t) {
+      var sum = 0, filled = 0, live = 0;
+      series.forEach(function (s) {
+        var i = cursor[s.symbol];
+        /* 指针只前进：把所有 t' <= t 的点吃掉，最后一个即为该时刻的有效价 */
+        while (i + 1 < s.pts.length && s.pts[i + 1].t <= t) { i++; lastPrice[s.symbol] = s.pts[i].p; }
+        cursor[s.symbol] = i;
+        var price = lastPrice[s.symbol];
+        if (price === null || price === undefined) return;   // 该标的在此刻之前完全没有数据
+        live++;
+        if (i >= 0 && s.pts[i].t !== t) filled++;            // 用了前值填充（不是恰好命中该时刻）
+        sum += s.qty * price * s.rate;
+      });
+      /* 一个标的都没覆盖到的时刻没有意义，跳过（极少数标的停牌的时段） */
+      if (!live) return;
+      out.push({ t: t, mv: sum, filled: filled });
+    });
+
+    return { points: out, missing: missing };
+  }
+
   return {
     ALL: ALL,
+    alignMinute: alignMinute,
     perSharePretax: perSharePretax,
     perShareAfterTax: perShareAfterTax,
     payoutDate: payoutDate,
@@ -6461,6 +7027,16 @@ XJ.calc = (function () {
         net: p.netInvested,
       };
     },
+    /* v6 新增：技术信号（布林带下轨 + KDJ） */
+    smaSeries: smaSeries,
+    stdSeries: stdSeries,
+    boll: boll,
+    kdj: kdj,
+    mondayOf: mondayOf,
+    withLiveBar: withLiveBar,
+    withLiveWeek: withLiveWeek,
+    weekLiveBar: weekLiveBar,
+    bollSignal: bollSignal,
   };
 })();
 
@@ -6477,11 +7053,14 @@ XJ.store = (function () {
 
     /* 运行时缓存（不落盘、不进导出 JSON）：
        minute = 当日分时（symbol → {date, points}），只在交易时段取、每次同步刷新
-       indexMinute = 对比指数的当日分时（indexKey → {date, points}） */
+       indexMinute = 对比指数的当日分时（indexKey → {date, points}）
+       klineTriedAt = 'YYYY-MM-DD'，记录 OHLC K 线（技术信号用）今天是否已尝试过取数。
+         失败也要记，否则每轮同步都会为同一只票反复重试、拖慢整体速度。 */
     minute: {},
     minuteAt: null,
     indexMinute: {},
     indexMinuteAt: null,
+    klineTriedAt: null,
 
     /** 纯 UI 状态，不持久化 */
     ui: {
@@ -7081,6 +7660,28 @@ XJ.views.overview = (function () {
    * 结构：身份行（图标 / 名称 + 实心涨跌徽章 / 代码）→ 当日分时（交易时段内）→ 四列数据。
    * 代码用市场缩写大写（SH601919），不再单独挂「沪」标签，也不再写「· 股票」。
    */
+
+  /**
+   * 技术信号标记（BOLL 下轨 + KDJ 的 J<0）。
+   *
+   * 口径与红线：
+   *   - 文案是中性的「日线下轨 / 周线下轨」，不出现「买入/卖出/推荐」等字样
+   *     （项目红线：只做记录，不构成投资建议）。
+   *   - 结果【绝不缓存】：K 线缓存是历史，现价每跳一次都可能让信号亮/灭，
+   *     所以每次 render 都现算一遍。
+   *   - 周线优先于日线（两个都亮时只显示周线）。
+   *
+   * @returns 有信号时返回 { text, cls }，否则 null
+   */
+  function signalOf(h) {
+    var st = XJ.store;
+    var cache = st.state.klineCache && st.state.klineCache[h.symbol];
+    if (!cache || !cache.day || cache.day.length < 2) return null;
+    var sig = XJ.calc.bollSignal(h.symbol, cache.day, cache.week || [], h.price, XJ.util.today());
+    if (!sig) return null;
+    return { text: sig.text, cls: sig.cls };
+  }
+
   function holdingCard(h) {
     var chg = h.changePct;
     var dir = (chg === null || chg === undefined) ? 'flat' : U.direction(chg);
@@ -7089,6 +7690,12 @@ XJ.views.overview = (function () {
        这里只保留极少触发、但出现即重要的「已回本」。 */
     var tag = h.costRecovered ? '<span class="hc-tag pill div">已回本</span>' : '';
     var mvDec = (h.marketValue !== null && Math.abs(h.marketValue) >= 10000) ? 0 : 2;
+
+    /* 技术信号（中性文案，随现价每次重算；周线优先于日线） */
+    var sigObj = signalOf(h);
+    var sig = sigObj
+      ? '<span class="hc-sig ' + sigObj.cls + '">' + U.esc(sigObj.text) + '</span>'
+      : '';
 
     /* 当日分时：只在交易时段内展示（非交易时段不画一条不动的线，免得看着像实时） */
     var min = XJ.store.minute[h.symbol];
@@ -7117,6 +7724,7 @@ XJ.views.overview = (function () {
       '<div class="hc-name"><span class="nm">' + U.esc(h.name) + '</span>' + tag + '</div>' +
       '<div class="hc-code">' + U.esc(XJ.market.displayCode(h.symbol)) +
       (chg === null || chg === undefined ? '' : '<span class="chg ' + dir + '">' + U.signPct(chg) + '</span>') +
+      sig +
       '</div>' +
       '</div>' +
       '<div class="hc-right">' +
@@ -7422,12 +8030,18 @@ XJ.views.networth = (function () {
     var candles = null;
     var candleName = '';
     var common = null;
+    var intradayMissing = [];
 
-    if (isPct) {
+    if (isToday) {
+      /* 当日：三种指标都走分时曲线（收益率用百分比并可叠加指数；市值 / 净资产用绝对金额）。
+         早先只有收益率分支处理「当日」，另两种指标落到日粒度序列上——而「当日」区间下日序列
+         只剩 1 个点，于是必然命中空态，看起来像「曲线不显示」。
+         当日没有「共同起点」一说（横轴是时刻不是日期），故不计算 common。 */
+      chartSeries = buildIntraday(st, metric);
+      intradayMissing = buildIntraday.missing || [];
+    } else if (isPct) {
       /* 组合收益率：与指数取共同起点，才谈得上可比 */
-      var idxPts = b.twr.map(function (p) { return { date: p.date, idx: p.idx }; });
-      var wanted = [];
-      /* 先把要显示的指数取出来，算出共同起点 */
+      var idxPts0 = b.twr.map(function (p) { return { date: p.date, idx: p.idx }; });
       var rawIdx = [];
       (st.state.settings.indexCompare || []).forEach(function (key) {
         var def = MK.indexDef(key);
@@ -7438,34 +8052,29 @@ XJ.views.networth = (function () {
         rawIdx.push({ key: key, def: def, bars: bars, first: bars[0].d });
       });
       common = XJ.calc.commonStart(
-        [{ date: idxPts.length ? idxPts[0].date : '' }].concat(rawIdx.map(function (r) { return { date: r.first }; }))
+        [{ date: idxPts0.length ? idxPts0[0].date : '' }].concat(rawIdx.map(function (r) { return { date: r.first }; }))
       );
-      if (!isToday) {
-        /* 日粒度：组合 + 指数都以「相对共同起点的百分比」表示 */
-        var portPts = XJ.calc.rebasePercent(idxPts, 'idx', common);
-        if (portPts.length >= 2) {
-          chartSeries.push({
-            key: 'ret', name: '组合收益率', color: MK.METRIC_COLORS.ret, points: portPts,
-          });
-        }
-        rawIdx.forEach(function (r) {
-          if (mode === 'candle') {
-            /* K线模式：只画组合折线 + **第一个**选中指数的蜡烛（组合没有 OHLC）。
-               否则一堆指数曲线会把蜡烛整片盖住，什么也看不出来。 */
-            if (!candles) {
-              candles = XJ.calc.indexCandles(r.bars, common);
-              candleName = r.def.name;
-            }
-            return;
-          }
-          var pts = XJ.calc.rebasePercent(r.bars, 'c', common);
-          if (pts.length < 2) return;
-          chartSeries.push({ key: r.key, name: r.def.name, color: MK.indexColor(r.key), points: pts });
+      /* 日粒度：组合 + 指数都以「相对共同起点的百分比」表示 */
+      var portPts = XJ.calc.rebasePercent(idxPts0, 'idx', common);
+      if (portPts.length >= 2) {
+        chartSeries.push({
+          key: 'ret', name: '组合收益率', color: MK.METRIC_COLORS.ret, points: portPts,
         });
-      } else {
-        /* 当日：用分时数据画当天曲线 */
-        chartSeries = buildIntraday(st, common);
       }
+      rawIdx.forEach(function (r) {
+        if (mode === 'candle') {
+          /* K线模式：只画组合折线 + **第一个**选中指数的蜡烛（组合没有 OHLC）。
+             否则一堆指数曲线会把蜡烛整片盖住，什么也看不出来。 */
+          if (!candles) {
+            candles = XJ.calc.indexCandles(r.bars, common);
+            candleName = r.def.name;
+          }
+          return;
+        }
+        var pts = XJ.calc.rebasePercent(r.bars, 'c', common);
+        if (pts.length < 2) return;
+        chartSeries.push({ key: r.key, name: r.def.name, color: MK.indexColor(r.key), points: pts });
+      });
     } else {
       var color = metric === 'nw' ? MK.METRIC_COLORS.nw : MK.METRIC_COLORS.mv;
       chartSeries = [{ key: metric, name: metricLabel, color: color, points: series.map(function (p) {
@@ -7505,13 +8114,18 @@ XJ.views.networth = (function () {
       var hasAnyHistory = Object.keys(st.state.priceHistory || {}).length > 0;
       html += '<div class="tiny" style="padding:14px 2px;text-align:center;line-height:1.8">' +
         (isToday
-          ? '「当日」需要分时数据：当前不在交易时段或没有取到分时。切到其它区间可看日粒度曲线。'
+          ? (st.ui.busy
+            ? '正在获取当日分时行情，稍后即可看到曲线…'
+            : '还没有当日的分时行情。点下方「刷新行情」拉一次分时；收盘后当天分时通常仍可保留。')
           : (st.ui.historyBusy
             ? '正在获取历史行情，稍后即可看到曲线…'
             : (hasAnyHistory
               ? '区间内没有足够的交易日数据。换个区间（如「全部」）看看。'
               : '还没有历史行情数据。点下方「获取历史行情」后即可画出曲线。'))) +
         '</div>';
+      if (isToday && !st.ui.busy) {
+        html += '<button class="btn-block ghost" data-act="refresh">刷新行情</button>';
+      }
       if (!isToday && !st.ui.historyBusy && !hasAnyHistory) {
         html += '<button class="btn-block ghost" data-act="fetchHistory">获取历史行情</button>';
       }
@@ -7549,14 +8163,39 @@ XJ.views.networth = (function () {
           }).join('') + '</div>';
         }
       }
+    } else if (isPct) {
+      /* 当日收益率：大数字 = 相对当日首个报价的涨跌幅；下方逐条对比各指数当日涨幅 */
+      var pv = chartSeries[0];
+      var lastT = pv ? pv.points[pv.points.length - 1] : null;
+      var curP = lastT ? lastT.pct : null;
+      html += '<div class="nw-amount' + (curP !== null && curP < 0 ? ' down' : '') + '">' +
+        (curP === null ? '—' : U.signPct(curP)) + '</div>';
+      html += '<div class="tiny nw-sub">组合收益率（TWR，含股息）· 当日盘中' +
+        (lastT ? ' · 截至 ' + U.esc(lastT.date) : '') + '</div>';
+      var idxRows = chartSeries.filter(function (s) { return s.key !== 'ret'; }).map(function (s) {
+        var last = s.points[s.points.length - 1];
+        return { name: s.name, pct: last ? last.pct : null, color: s.color };
+      });
+      if (curP !== null && idxRows.length) {
+        html += '<div class="nw-vs">' + idxRows.map(function (r) {
+          var diff = r.pct === null ? null : curP - r.pct;
+          return '<span class="nw-vsitem"><i style="background:' + r.color + '"></i>' + U.esc(r.name) +
+            '<b>' + (r.pct === null ? '—' : U.signPct(r.pct)) + '</b>' +
+            (diff === null ? '' : '<em class="' + (diff >= 0 ? 'c-up' : 'c-down') + '">' +
+              (diff >= 0 ? '领先 ' : '落后 ') + U.pct(Math.abs(diff)) + '</em>') + '</span>';
+        }).join('') + '</div>';
+      }
     } else {
       var curV = (isToday && chartSeries.length)
         ? chartSeries[0].points[chartSeries[0].points.length - 1].pct
         : (series.length ? series[series.length - 1][metric] : null);
       html += '<div class="nw-amount">' + (curV === null ? '—' : U.moneySign(curV)) + '</div>';
       html += '<div class="tiny nw-sub">' + U.esc(metricLabel) +
-        (series.length ? ' · 截至 ' + U.esc(series[series.length - 1].date) : '') + '</div>';
+        (isToday && chartSeries.length
+          ? ' · 当日盘中 · 截至 ' + U.esc(chartSeries[0].points[chartSeries[0].points.length - 1].date)
+          : (series.length ? ' · 截至 ' + U.esc(series[series.length - 1].date) : '')) + '</div>';
       if (isToday && chartSeries.length) {
+        /* 当日盘中变动：用曲线的首末点相减（不是日粒度的「较上日」） */
         var firstP = chartSeries[0].points[0].pct;
         var lastP = chartSeries[0].points[chartSeries[0].points.length - 1].pct;
         var dToday = lastP - firstP;
@@ -7578,7 +8217,7 @@ XJ.views.networth = (function () {
       return { key: s.key, name: s.name, color: s.color, points: s.points };
     });
     html += '<div class="nw-chart">' + XJ.chart.renderCompare(chartPts, {
-      mode: mode, candles: candles, xTicks: 4,
+      mode: isToday ? 'line' : mode, candles: candles, xTicks: 4,
       unit: isPct ? '%' : 'money',
       fmtY: isPct ? U.pctAxis : U.moneyAxis,
     }) + '</div>';
@@ -7593,10 +8232,19 @@ XJ.views.networth = (function () {
 
     /* 口径与缺口说明 */
     var notes = [];
-    if (isPct) {
+    if (isToday) {
+      notes.push('当日为分时曲线：按各标的的分钟报价对齐后累加，某只标的缺某个时刻的报价时沿用其前值');
+      if (isPct) {
+        notes.push('涨跌幅以当日首个报价为基准；指数按同一基准归一化，可横向比较');
+      } else if (metric === 'nw') {
+        notes.push('净资产 = 持仓总市值（分时） + 累计已收分红 − 累计净投入');
+      } else {
+        notes.push('持仓市值按分时价格折算人民币；跨市场标的按设置里的汇率换算');
+      }
+    } else if (isPct) {
       notes.push('收益率 = 时间加权收益率（TWR）：按日剔除加仓/减仓的净流入后再连乘，可与指数公平对比');
       notes.push('指数涨幅按同一区间起点归一化；不同市场交易日不同，取共同起点');
-      if (!isToday && mode === 'candle' && candles && candles.length) {
+      if (mode === 'candle' && candles && candles.length) {
         notes.push('蜡烛为「' + candleName + '」的收益率 K 线（组合没有 K 线，仍以折线显示）');
       }
     } else if (metric === 'nw') {
@@ -7604,8 +8252,11 @@ XJ.views.networth = (function () {
     } else {
       notes.push('按「交易流水还原持股数 × 当日真实收盘价」折算人民币；同日有每日快照时以快照为准');
     }
-    if (b.res.missing.length) {
+    if (!isToday && b.res.missing.length) {
       notes.push('有 ' + b.res.missing.length + ' 只标的没有历史行情（场外基金净值或长期停牌），未计入曲线');
+    }
+    if (isToday && intradayMissing && intradayMissing.length) {
+      notes.push('有 ' + intradayMissing.length + ' 只标的没有当日分时（场外基金 / 美股 / 长期停牌），未计入曲线');
     }
     html += '<div class="note-line" style="margin-top:8px">' + UI.icon('info', 13) +
       '<span>' + U.esc(notes.join('；')) + '</span></div>';
@@ -7614,68 +8265,96 @@ XJ.views.networth = (function () {
     return html;
   }
 
+  /** 当日分时的汇率取值（HKD / USD 换人民币，未配置时按 1） */
+  function fxRate(st, cur) {
+    var fx = st.state.settings.fx || {};
+    if (cur === 'HKD') return U.num(fx.HKD) || 1;
+    if (cur === 'USD') return U.num(fx.USD) || 1;
+    return 1;
+  }
+
   /**
    * 「当日」曲线：用分时数据画当天走势。
-   * 组合：每个时点 Σ(当日持股数 × 该时点价格 × 汇率)；指数：分时点位。
-   * 一律换算成「相对当日开盘的百分比」，与指数同坐标系。
+   * 组合：每个时刻 Σ(当日持股数 × 该时刻价格 × 汇率)，多标的按**时间戳**对齐（calc.alignMinute），
+   * 缺失时刻沿用前值，因此不会因某只标的少一个报价点就整段塌陷。
+   * 三种指标各取所需：
+   *   收益率   → 相对当日首个报价的百分比（与指数同坐标系，可叠加对比）
+   *   持仓市值 → 组合市值的绝对值（元）
+   *   净资产   → 持仓总市值 + 累计已收分红 − 累计净投入（元），随市值实时波动
+   * @param metric 'ret' | 'mv' | 'nw'
    */
-  function buildIntraday(st, common) {
+  function buildIntraday(st, metric) {
     var out = [];
-    var fx = st.state.settings.fx || {};
-    var rate = function (cur) {
-      if (cur === 'HKD') return U.num(fx.HKD) || 1;
-      if (cur === 'USD') return U.num(fx.USD) || 1;
-      return 1;
-    };
-    var hs = XJ.calc.holdings(st.state, st.acc());
+    var acc = st.acc();
+    var hs = XJ.calc.holdings(st.state, acc);
+    /* 净资产在当日 = 组合市值 + 累计已收分红 − 累计净投入。
+       后两项与盘口无关，先算成一个常量（与 calc.marketValueSeries 的口径一致：
+       分红按账户过滤，净投入取各持仓头寸的 netInvested）。 */
+    var nwAdj = 0;
+    if (metric === 'nw') {
+      hs.forEach(function (h) { nwAdj -= U.n0(h.netInvested); });
+      (st.state.received || []).forEach(function (r) {
+        if (acc !== XJ.calc.ALL && r.accountId !== acc) return;
+        nwAdj += U.n0(r.amount);
+      });
+    }
 
-    /* 组合分时 */
-    var mins = st.minute || {};
-    var acc = {};
-    hs.forEach(function (h) {
-      var m = mins[h.symbol];
-      if (!m || !m.points || m.points.length < 2) return;
-      var r = rate(h.currency);
-      m.points.forEach(function (p, i) {
-        if (p.p === null) return;
-        acc[i] = (acc[i] || 0) + h.qty * p.p * r;
-      });
-    });
-    var keys = Object.keys(acc).map(Number).sort(function (a, b) { return a - b; });
-    if (keys.length >= 2) {
-      var firstVal = acc[keys[0]];
-      var anyMin = null;
-      hs.forEach(function (h) {
-        var m = mins[h.symbol];
-        if (m && m.points && m.points.length >= 2 && (!anyMin || m.points.length > anyMin.points.length)) anyMin = m;
-      });
-      if (firstVal > 0) {
+    /* ---- 组合分时：按时间戳对齐后累加 ---- */
+    var al = XJ.calc.alignMinute(hs, st.minute || {}, function (cur) { return fxRate(st, cur); });
+    var mvPts = al.points;
+    if (mvPts.length >= 2) {
+      var color = metric === 'nw' ? MK.METRIC_COLORS.nw
+        : metric === 'ret' ? MK.METRIC_COLORS.ret : MK.METRIC_COLORS.mv;
+      var name = metric === 'nw' ? '净资产' : metric === 'ret' ? '组合' : '持仓市值';
+
+      if (metric === 'ret') {
+        /* 收益率：以当日首个报价为基准。基准必须 > 0 —— 用绝对值当基准时，
+           若开盘就已有持仓成本为负（分红已回本），百分比会算出无意义的大数 */
+        var base = mvPts[0].mv;
+        if (base > 0) {
+          out.push({
+            key: 'ret', name: name, color: color,
+            points: mvPts.map(function (p) {
+              return { date: p.t, pct: Math.round((p.mv / base - 1) * 10000) / 100 };
+            }),
+          });
+        }
+      } else {
+        /* 市值 / 净资产：绝对值。净资产在当日把「累计已收分红 − 累计净投入」当常量加进去，
+           盘中的分红到账会让这个常量台阶式跳一次，这是符合预期的（分红是离散事件） */
         out.push({
-          key: 'ret', name: '组合', color: MK.METRIC_COLORS.ret,
-          points: keys.map(function (i) {
-            return { date: (anyMin && anyMin.points[i]) ? anyMin.points[i].t : String(i),
-              pct: Math.round((acc[i] / firstVal - 1) * 10000) / 100 };
+          key: metric, name: name, color: color,
+          points: mvPts.map(function (p) {
+            return { date: p.t, pct: Math.round((p.mv + nwAdj) * 100) / 100 };
           }),
         });
       }
     }
 
-    /* 指数分时 */
-    var im = st.indexMinute || {};
-    (st.state.settings.indexCompare || []).forEach(function (key) {
-      var def = MK.indexDef(key);
-      var m = im[key];
-      if (!def || !m || !m.points || m.points.length < 2) return;
-      var vals = m.points.map(function (p) { return p.p; }).filter(function (v) { return v !== null; });
-      if (vals.length < 2 || !vals[0]) return;
-      out.push({
-        key: key, name: def.name, color: MK.indexColor(key),
-        points: m.points.map(function (p) {
-          return { date: p.t, pct: p.p === null ? 0 : Math.round((p.p / vals[0] - 1) * 10000) / 100 };
-        }),
+    /* ---- 指数分时（仅收益率模式叠加，与日粒度口径一致） ---- */
+    if (metric === 'ret') {
+      var im = st.indexMinute || {};
+      (st.state.settings.indexCompare || []).forEach(function (key) {
+        var def = MK.indexDef(key);
+        var m = im[key];
+        if (!def || !m || !m.points || m.points.length < 2) return;
+        /* 指数分时同样按时间戳取点，并把「首个有效价」当基准（首个点可能为空） */
+        var raw = m.points.filter(function (p) { return p && p.t && U.num(p.p) !== null; })
+          .sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
+        if (raw.length < 2) return;
+        var base = U.num(raw[0].p);
+        if (!base) return;
+        out.push({
+          key: key, name: def.name, color: MK.indexColor(key),
+          points: raw.map(function (p) {
+            return { date: p.t, pct: Math.round((U.num(p.p) / base - 1) * 10000) / 100 };
+          }),
+        });
       });
-    });
-    void common;
+    }
+
+    /* 缺口标的（没有分时的：场外基金 / 美股 / 长期停牌），由 render 写进说明行 */
+    buildIntraday.missing = al.missing || [];
     return out;
   }
 
@@ -8589,6 +9268,19 @@ XJ.views.analysis = (function () {
 XJ.views.symbol = (function () {
   var U = XJ.util, UI = XJ.ui, C = XJ.views.common;
 
+  /**
+   * 技术信号（BOLL 下轨 + KDJ 的 J<0）。
+   * 与持仓卡片保持同一口径：中性文案、周线优先、结果不缓存、每次 render 现算。
+   * 这里单独实现一份（而非从 views.common 导出），是因为两处取 price 的方式不同：
+   * 卡片用 h.price，详情页在无持仓时会退回 quoteCache 的价格。
+   */
+  function signalOf(symbol, price) {
+    var cache = XJ.store.state.klineCache && XJ.store.state.klineCache[symbol];
+    if (!cache || !cache.day || cache.day.length < 2) return null;
+    var sig = XJ.calc.bollSignal(symbol, cache.day, cache.week || [], price, U.today());
+    return sig ? { text: sig.text, cls: sig.cls } : null;
+  }
+
   function render() {
     var st = XJ.store;
     var symbol = st.ui.subArg;
@@ -8609,6 +9301,11 @@ XJ.views.symbol = (function () {
     var quote = st.state.quoteCache[symbol];
     var price = h ? h.price : (quote ? U.num(quote.price) : null);
     var html = '';
+
+    /* 技术信号（中性文案「日线下轨 / 周线下轨」，周线优先）。
+       与持仓卡片共用同一套纯函数与口径，结果每次 render 现算、不缓存。 */
+    var sigObj = signalOf(symbol, price);
+    var sig = sigObj ? '<span class="hc-sig ' + sigObj.cls + '">' + U.esc(sigObj.text) + '</span>' : '';
 
     /* 无分红数据源的市场（如美股）如实提示，并给出手工补录的出口 */
     if (!XJ.market.supportsDividend(symbol)) {
@@ -8642,7 +9339,7 @@ XJ.views.symbol = (function () {
       (h && h.changePct !== null && h.changePct !== undefined
         ? '<span class="chg ' + (U.direction(h.changePct) === 'flat' ? 'flat' : U.direction(h.changePct)) + '">' + U.signPct(h.changePct) + '</span>' : '') +
       '</div>' +
-      '<div class="row-s">' + U.esc(XJ.market.displayCode(symbol)) + '</div>' +
+      '<div class="row-s">' + U.esc(XJ.market.displayCode(symbol)) + sig + '</div>' +
       '</div>' +
       '<div style="text-align:right">' +
       '<div class="row-v ' + U.dirClass(h ? h.changePct : null) + '">' +
@@ -9080,6 +9777,7 @@ XJ.views.symbol = (function () {
         /* 收尾工作放后台：官方图标解析、历史行情、对比指数（都可能慢，不该卡住主流程） */
         resolveLogosNow(false);
         ensureHistory(false);
+        ensureKline(false);
         ensureIndexData(false);
         refreshIndexMinutes();
       });
@@ -9279,12 +9977,68 @@ XJ.views.symbol = (function () {
   }
 
   /**
-   * 名称补全。纳入三种情况：
-   *   ① 名称是代码或空（hasNameInfo 为假）
-   *   ② nameSuspect —— 行情名被交易所前缀挤占（除息日「XD中国平」→ 只剩「中国平」）
-   *   ③ nameSuspect 为 undefined —— 老数据，做一次性兜底
-   * 同一天每个标的最多反查一次；用户手动改过名字（nameLocked）的永不覆盖。
+   * 技术信号的 OHLC K 线缓存（每只标的每天刷新一次，落在 state.klineCache）。
+   *
+   * 与 ensureHistory 的分工：
+   *   - ensureHistory 取的是【收盘价序列】，供资产走势画曲线（不复权、要长期）；
+   *   - ensureKline 取的是【完整 OHLC】，供 BOLL / KDJ 计算（只需近 60 根）。
+   * 两套缓存互不干扰：K 线拿不到时资产走势照常，反之亦然。
+   *
+   * 场外基金（of）没有盘中 K 线，直接排除；美股要靠 quoteCode 带交易所后缀。
    */
+  var klineBusy = false;
+  function ensureKline(force) {
+    if (klineBusy || !S.state) return Promise.resolve(0);
+    var syms = S.activeSymbols();
+    if (!syms.length) return Promise.resolve(0);
+    var today = U.today();
+    /* 失败也要记账，否则每轮同步都会为同一只票反复重试。
+       与 ensureHistory 用 S.ui.historyTriedAt 不同，这里 S.klineTriedAt 是单一日期的
+       整体标记：K 线是一次性批量请求，全体共用一次尝试。 */
+    if (force) S.klineTriedAt = null;
+    if (!S.state.klineCache) S.state.klineCache = {};
+    if (S.klineTriedAt === today) return Promise.resolve(0);
+
+    var need = syms.filter(function (sym) {
+      if (XJ.market.assetType(sym) === 'of') return false;
+      var rec = S.state.klineCache[sym];
+      if (force) return true;
+      if (!rec || !rec.day || rec.day.length < 2) return true;   // 从未取到过 → 再试
+      return rec.at !== today;
+    });
+    if (!need.length) { S.klineTriedAt = today; return Promise.resolve(0); }
+
+    klineBusy = true;
+    S.klineTriedAt = today;
+
+    /* 美股需要带交易所后缀的代码（行情同步时记下来的 quoteCode）才能取到完整 K 线 */
+    var codes = {};
+    need.forEach(function (sym) {
+      var rec = S.state.symbols[sym];
+      if (rec && rec.quoteCode) codes[sym] = rec.quoteCode;
+    });
+
+    return XJ.fetcher.fetchKlineBundle(need, { count: 60, codes: codes }).then(function (map) {
+      var got = 0;
+      Object.keys(map).forEach(function (sym) {
+        var pack = map[sym];
+        if (!pack || !pack.day || pack.day.length < 2) return;
+        /* 分析只用近 60 根，但留 120 根余量：多出的历史让 KDJ 的 K/D 从初值 50 收敛得更充分 */
+        var day = pack.day.length > 120 ? pack.day.slice(-120) : pack.day;
+        var week = (pack.week || []).length > 120 ? pack.week.slice(-120) : (pack.week || []);
+        S.state.klineCache[sym] = { at: today, day: day, week: week };
+        got++;
+      });
+      klineBusy = false;
+      S.commitNow(null);
+      return got;
+    }).catch(function () {
+      klineBusy = false;
+      S.notify();
+      return 0;
+    });
+  }
+
   function healSymbolNames() {
     var today = U.today();
     var need = Object.keys(S.state.symbols).filter(function (sym) {
@@ -10856,8 +11610,8 @@ XJ.views.symbol = (function () {
 
   UI.on('fetchHistory', function () {
     UI.toast('正在获取历史行情…');
-    Promise.all([ensureHistory(true), ensureIndexData(true)]).then(function (r) {
-      var n = (r[0] || 0) + (r[1] || 0);
+    Promise.all([ensureHistory(true), ensureKline(true), ensureIndexData(true)]).then(function (r) {
+      var n = (r[0] || 0) + (r[1] || 0) + (r[2] || 0);
       UI.toast(n ? '已更新 ' + n + ' 项历史行情' : '历史行情获取失败，可稍后重试');
     });
   });
