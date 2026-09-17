@@ -856,6 +856,36 @@ table.tbl tbody tr:active{ background:var(--card-2); }
 /* 多曲线时图例左对齐并允许换行 */
 .nw-legend-left{ justify-content:flex-start; flex-wrap:wrap; gap:4px 12px; margin-top:6px; }
 
+/* ==================== 个股详情：股息率曲线 ==================== */
+/* 限宽的理由同 .nw-chart：SVG 是固定 viewBox + width:100%，不限宽在桌面端会被拉伸好几倍 */
+.yj-chart{ margin-top:4px; max-width:560px; margin-left:auto; margin-right:auto; }
+.yj-brush{ max-width:560px; margin:2px auto 0; }
+.yj-brush svg{ display:block; width:100%; height:54px; touch-action:none; user-select:none; -webkit-user-select:none; }
+.yj-brush .xjc-brush-h{ cursor:ew-resize; }
+.yj-brush .xjc-brush-sel{ cursor:grab; }
+
+/* 图例：与参考图一致（线段 = 曲线，方块 = 散点）。余额宝那条是可点开关，关掉时整体压灰 */
+.yj-legend{
+  display:flex; align-items:center; flex-wrap:wrap; gap:4px 12px;
+  font-size:11px; color:var(--text-2); margin:2px 0 4px;
+}
+.yj-legend .on{ display:inline-flex; align-items:center; gap:5px; }
+.yj-legend i{ display:inline-block; flex:0 0 auto; }
+.yj-legend i.ln{ width:14px; height:2.5px; border-radius:2px; }
+/* 虚线图例（平均股息率）：颜色由内联的 --lnc 给，背景要让位给虚线边框 */
+.yj-legend i.ln.dash{ height:0; border-radius:0; background:none; border-top:2px dashed var(--lnc,currentColor); }
+.yj-legend i.sq{ width:8px; height:8px; border-radius:2px; }
+.yj-legend .yj-leg-btn{
+  display:inline-flex; align-items:center; gap:5px; padding:2px 6px; margin:0 -6px;
+  border-radius:7px; font-size:11px; color:var(--text-2); transition:background .14s ease;
+}
+.yj-legend .yj-leg-btn:active{ background:var(--card-2); }
+.yj-legend .yj-leg-btn.off{ color:var(--text-3); }
+.yj-note{ color:var(--text-3); margin-top:8px; padding-top:8px; border-top:.5px solid var(--line-2); }
+/* 当前读数 vs 平均股息率（中性表述，只给「高于 / 低于」） */
+.yj-avg-stat{ color:var(--text-2); margin:0 0 6px; }
+.yj-avg-stat b{ font-weight:500; color:var(--text); }
+
 /* 顶部区间条（对齐参考图：当日 / 本月 / 近三月 / …） */
 .nw-ranges-top{
   display:flex; gap:6px; overflow-x:auto; -webkit-overflow-scrolling:touch;
@@ -1481,6 +1511,17 @@ XJ.market = (function () {
   function dividendSource(symbol) { var a = asset(symbol); return a ? a.dividend : null; }
   /** 该标的是否支持自动同步分红（美股暂无公开可用的免费分红源） */
   function supportsDividend(symbol) { return !!dividendSource(symbol); }
+
+  /**
+   * 该标的是否能画「按财年」的股息率曲线。
+   *   · 美股    → 没有分红数据源，取不到任何方案
+   *   · 场外基金 → 分红不定期、没有「财年派现」这个概念，且没有盘中 K 线
+   * 其余（A股 / 港股 / ETF）都可以。这个判定必须与 fetcher.fetchYieldHistory 的过滤条件一致，
+   * 否则会出现「界面说能画、数据却永远取不到」的空态。
+   */
+  function supportsYieldCurve(symbol) {
+    return supportsDividend(symbol) && assetType(symbol) !== 'of';
+  }
   /** 分红数据源的中文说明（用于界面提示） */
   function dividendSourceLabel(symbol) {
     return ({ cn: '东方财富股票分红', hk: '东方财富港股 F10 分红', fund: '天天基金分红' })[dividendSource(symbol)] || '暂不支持自动同步';
@@ -1827,7 +1868,8 @@ XJ.market = (function () {
     sessionOpen: sessionOpen, hasMinute: hasMinute, hasDailyHistory: hasDailyHistory,
     orgInfoQuery: orgInfoQuery,
     isQuoteable: isQuoteable, dividendSource: dividendSource,
-    supportsDividend: supportsDividend, dividendSourceLabel: dividendSourceLabel,
+    supportsDividend: supportsDividend, supportsYieldCurve: supportsYieldCurve,
+    dividendSourceLabel: dividendSourceLabel,
     secucodeOf: secucodeOf, logoUrl: logoUrl, logoVerdict: logoVerdict,
     rootDomain: rootDomain, cleanDomain: cleanDomain,
     logoCandidates: logoCandidates, thsF10Url: thsF10Url,
@@ -1957,6 +1999,26 @@ XJ.model = (function () {
   function currencyOf(symbol) { return XJ.market.currency(symbol); }
   function marketKind(symbol) { return XJ.market.kind(symbol); }
 
+  /**
+   * 归一化「[['YYYY-MM-DD', 数值], ...]」这类轻量序列（股息率曲线 / 余额宝基准用）。
+   * 只保留日期合法、数值为正有限的行，按日期升序去重（同日后出现者覆盖前者）。
+   * 坏数据一律剔除而不是抛错：这两份缓存都是外部接口产物，宁可少画也不要整页崩。
+   */
+  function normCloseSeries(arr) {
+    if (!Array.isArray(arr)) return [];
+    var map = {};
+    for (var i = 0; i < arr.length; i++) {
+      var row = arr[i];
+      if (!row || row.length < 2) continue;
+      var d = String(row[0]).slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+      var v = U.num(row[1]);
+      if (v === null || !isFinite(v) || v <= 0) continue;
+      map[d] = v;
+    }
+    return Object.keys(map).sort().map(function (d) { return [d, map[d]]; });
+  }
+
   /* ---- 默认状态 ---- */
   function defaultState() {
     return {
@@ -1998,6 +2060,7 @@ XJ.model = (function () {
         showLogo: true,                  // 优先展示股票官方图标（取不到则回退字母头像）
         unsupportedDividend: [],         // 无分红数据源的标的（美股）
         indexCompare: ['sh', 'hs300', 'hsi'],   // 资产走势里默认勾选的对比指数
+        showYieldBench: false,           // 股息率曲线里是否叠加「余额宝七日年化」基准线（默认关）
       },
       quoteCache: {},       // symbol -> quote
       snapshots: {},        // 'YYYY-MM-DD' -> { mv, cost, pred, recv, fx }
@@ -2008,6 +2071,14 @@ XJ.model = (function () {
          at = 这批数据的交易日（取接口 date，不是本机今日），每只标的只保留最近 1 天。
          落盘持久化：收盘后 / 周末打开也要能看到最近一个交易日的分时曲线。 */
       minuteCache: null,
+      /* 股息率曲线的收盘价缓存：symbol -> { at:'YYYY-MM-DD', day:[['YYYY-MM-DD',close]], week:[...] }
+         与 klineCache 分开存的理由：那套是完整 OHLC、只留 120 根、给 BOLL/KDJ 用；
+         这套只要收盘价就能算股息率，且日线要留 320 根（≈1.2 年）、周线 640 根（≈12.5 年）
+         来撑满「最近十年」—— 把两套需求的量级塞进同一个缓存会让技术信号白白背上一堆数据。 */
+      yieldHistory: {},
+      /* 余额宝七日年化（全局一份，不是 per-symbol）：
+         { at:'YYYY-MM-DD', points:[['YYYY-MM-DD', pct]] }，按周降采样（约 520 点覆盖 10 年） */
+      benchHistory: null,
     };
   }
 
@@ -2106,6 +2177,34 @@ XJ.model = (function () {
     if (!state.settings) state.settings = {};
     if (!Array.isArray(state.settings.indexCompare)) {
       state.settings.indexCompare = ['sh', 'hs300', 'hsi'];
+    }
+    if (state.settings.showYieldBench !== true) state.settings.showYieldBench = false;
+
+    /* 股息率曲线的收盘价缓存（旧数据补齐 + 结构校验）。
+       每只标的要有 v=2 标记 + 一段升序的 [['YYYY-MM-DD', close], ...]（只存日线，最近十年）。
+       v=1 那版是「日线 320 根 + 周线 640 根」双粒度，会让曲线出现非交易日间隔，
+       且与新版混存会出现粒度忽粗忽细 —— 直接丢弃、由下一次同步重取。 */
+    if (!state.yieldHistory || typeof state.yieldHistory !== 'object') {
+      state.yieldHistory = {};
+    } else {
+      var yhOut = {};
+      for (var yhSym in state.yieldHistory) {
+        if (!Object.prototype.hasOwnProperty.call(state.yieldHistory, yhSym)) continue;
+        var yhOne = state.yieldHistory[yhSym];
+        if (!yhOne || typeof yhOne !== 'object') continue;
+        if (U.n0(yhOne.v) !== 2) continue;
+        var yhDay = normCloseSeries(yhOne.day);
+        if (yhDay.length < 2) continue;
+        yhOut[yhSym] = { v: 2, at: yhOne.at || null, day: yhDay };
+      }
+      state.yieldHistory = yhOut;
+    }
+    /* 余额宝七日年化基准（全局一份）：{ at, points:[['YYYY-MM-DD', pct]] } */
+    if (!state.benchHistory || typeof state.benchHistory !== 'object') {
+      state.benchHistory = null;
+    } else {
+      var bhPts = normCloseSeries(state.benchHistory.points);
+      state.benchHistory = bhPts.length >= 2 ? { at: state.benchHistory.at || null, points: bhPts } : null;
     }
 
     /* ---- v3 → v4 迁移：默认成本口径改为「分红摊薄」 ----
@@ -2221,6 +2320,10 @@ XJ.model = (function () {
       priceHistory: state.priceHistory,
       indexHistory: state.indexHistory,
       klineCache: state.klineCache,
+      /* 股息率曲线的收盘价与余额宝基准：都是要跑网络才拿得到的历史数据，
+         换设备后重新拉一遍很慢，所以随备份一起带走。 */
+      yieldHistory: state.yieldHistory,
+      benchHistory: state.benchHistory,
       /* minuteCache 不进导出 JSON：它是「当天分时」这种当天有效的运行时缓存，
          换台设备 / 隔几天再用都没意义，导出只会白白撑大备份文件。 */
     };
@@ -2244,6 +2347,8 @@ XJ.model = (function () {
     if (raw.priceHistory && typeof raw.priceHistory === 'object') out.priceHistory = raw.priceHistory;
     if (raw.indexHistory && typeof raw.indexHistory === 'object') out.indexHistory = raw.indexHistory;
     if (raw.klineCache && typeof raw.klineCache === 'object') out.klineCache = raw.klineCache;
+    if (raw.yieldHistory && typeof raw.yieldHistory === 'object') out.yieldHistory = raw.yieldHistory;
+    if (raw.benchHistory && typeof raw.benchHistory === 'object') out.benchHistory = raw.benchHistory;
     /* minuteCache 刻意不在白名单内：导入后为 null，下次刷新行情时自动重建当天分时 */
     if (raw.version) out.version = raw.version;
 
@@ -2323,6 +2428,7 @@ XJ.model = (function () {
     validateTransaction: validateTransaction,
     validateAccount: validateAccount,
     toExport: toExport, fromImport: fromImport,
+    normCloseSeries: normCloseSeries,
     transactionsCsv: transactionsCsv, receivedCsv: receivedCsv,
   };
 })();
@@ -3987,14 +4093,18 @@ XJ.fetcher = (function () {
    * 取单只标的指定周期的 OHLC K 线。
    * @param sym  内部代码，如 sh600036
    * @param period 'day' | 'week' | 'month'
-   * @param count 根数（默认 60，够 KDJ 的 K/D 从初值 50 收敛）
+   * @param count 根数上限（默认 60，够 KDJ 的 K/D 从初值 50 收敛）
    * @param codeOverride 美股必须带交易所后缀（复用 fetchPriceHistory 的口径）
+   * @param beg/end 可选起止日期（'YYYY-MM-DD'）。**这两个参数是真的生效的**
+   *        —— 实测 `code,day,2015-06-01,2015-12-31,640,` 精确返回该区间的 146 根。
+   *        缺省时留空（`code,day,,,60,`），与旧调用完全等价。
    */
-  function fetchKlineBars(sym, period, count, codeOverride) {
+  function fetchKlineBars(sym, period, count, codeOverride, beg, end) {
     var varName = 'xjkb_' + (++cbSeq) + '_' + Date.now().toString(36);
     var code = codeOverride ? XJ.market.marketOf(sym) + codeOverride : sym;
     var p = period === 'week' ? 'week' : (period === 'month' ? 'month' : 'day');
-    var url = KLINE_URL + code + ',' + p + ',,,' + (count || 60) + ',&_var=' + varName;
+    var url = KLINE_URL + code + ',' + p + ',' + (beg || '') + ',' + (end || '') + ',' +
+      (count || 60) + ',&_var=' + varName;
     return new Promise(function (resolve) {
       loadScript(url, null, PLAN_TIMEOUT, function () {
         var bars = parseKlineBars(window[varName], code);
@@ -4036,6 +4146,127 @@ XJ.fetcher = (function () {
       });
     }
     return step();
+  }
+
+  /**
+   * 股息率曲线用的收盘价：**最近十年的日线**（只取收盘价，股息率 = 每股派现 ÷ 收盘价，用不到 OHLC）。
+   *
+   * ★ 为什么是「分两个窗口」：
+   *   腾讯 fqkline 单次 `count` 的**硬上限是 2000 根**（实测 2000 正常、2050 起直接空返回），
+   *   而 2000 根日线只有约 8.2 年，撑不满「最近十年」。
+   *   好在它的 `beg`/`end` 参数**是生效的**（实测 `code,day,2015-06-01,2015-12-31,640,`
+   *   精确返回该区间的 146 根 —— 早先误以为被忽略，是因为拿 11 年的宽区间去测，被 count 截断成了最近 640 根）。
+   *   于是拆成「近 8 年」+「再往前 3 年」两次请求再拼接：实测合计 2601 根、跨 3907 天、无重复无缝隙。
+   *   两个窗口的边界日可能同时出现在两边，交给 normCloseSeries 按日期去重。
+   *
+   * 与 klineCache 分开存：那套是完整 OHLC、只留 120 根、给 BOLL/KDJ 用；
+   * 把两套量级混在一起会让技术信号白白背上一堆数据。
+   */
+  var YIELD_SPAN_DAYS = [0, 2920, 4020];   // 今天 / 8 年前 / 11 年前，切成两段
+  var YIELD_MAX_BARS = 2700;               // ≈10.7 年日线，再往上裁
+  function fetchYieldHistory(symbols, opts) {
+    opts = opts || {};
+    var list = (symbols || []).filter(function (s, i, a) {
+      return s && a.indexOf(s) === i && XJ.market.assetType(s) !== 'of';
+    });
+    if (!list.length) return Promise.resolve({});
+    var codes = opts.codes || {};
+    var today = opts.today || U.today();
+    var wins = [
+      { beg: U.addDays(today, -YIELD_SPAN_DAYS[1]), end: today, count: 2000 },
+      { beg: U.addDays(today, -YIELD_SPAN_DAYS[2]), end: U.addDays(today, -YIELD_SPAN_DAYS[1]), count: 900 },
+    ];
+    var out = {};
+    var i = 0;
+    function step() {
+      if (i >= list.length) return Promise.resolve(out);
+      var sym = list[i++];
+      var rows = [];
+      var w = 0;
+      /* 窗口逐个串行取，窗口之间也留间隔，避免被限流 */
+      function nextWindow() {
+        if (w >= wins.length) return Promise.resolve();
+        var win = wins[w++];
+        return fetchKlineBars(sym, 'day', win.count, codes[sym], win.beg, win.end).then(function (bars) {
+          (bars || []).forEach(function (b) { rows.push([b.d, b.c]); });
+          return new Promise(function (r) { setTimeout(r, 120); }).then(nextWindow);
+        });
+      }
+      return nextWindow().then(function () {
+        var pts = XJ.model.normCloseSeries(rows);
+        if (pts.length > YIELD_MAX_BARS) pts = pts.slice(-YIELD_MAX_BARS);
+        if (pts.length >= 2) out[sym] = { day: pts };
+        return null;
+      }).then(function () {
+        if (onHistoryTick) onHistoryTick(i, list.length, sym);
+        if (i >= list.length) return out;
+        return new Promise(function (r) { setTimeout(r, 150); }).then(step);
+      });
+    }
+    return step();
+  }
+
+  /* ---- 余额宝七日年化（对比基准） ----
+   * 天天基金 pingzhongdata 里的 Data_sevenDaysYearIncome = [[毫秒时间戳, 七日年化%], ...]，
+   * 与场外基金净值走同一条 <script> 注入通道（该域没有 CORS 头，只能靠注入执行 JS 变量）。
+   */
+  var BENCH_FUND_CODE = '000198';                 // 天弘余额宝
+  var BENCH_KEEP_YEARS = 10;
+
+  /**
+   * 纯解析：[[毫秒, pct], ...] → [['YYYY-MM-DD', pct], ...]（升序、按周降采样、裁到最近 10 年）
+   *
+   * 为什么按周：原始是日频（约 4856 点 / 13 年），但七日年化是极平滑的曲线，
+   * 日频画在 360px 宽的图上纯属浪费存储与渲染；按周取每周最后一个点即可。
+   */
+  function parseSevenDay(arr, opts) {
+    opts = opts || {};
+    if (!arr || !arr.length) return [];
+    var byWeek = {};
+    for (var i = 0; i < arr.length; i++) {
+      var row = arr[i];
+      if (!row || row.length < 2) continue;
+      var ms = U.num(row[0]), v = U.num(row[1]);
+      if (ms === null || v === null || !isFinite(v) || v <= 0) continue;
+      var d = new Date(ms);
+      if (isNaN(d.getTime())) continue;
+      var ymd = d.getFullYear() + '-' + U.pad2(d.getMonth() + 1) + '-' + U.pad2(d.getDate());
+      var wk = weekKey(d);
+      /* 同周内后出现的点覆盖前面的 → 最终留下每周最后一个点 */
+      if (!byWeek[wk] || ymd > byWeek[wk][0]) byWeek[wk] = [ymd, v];
+    }
+    var out = Object.keys(byWeek).sort().map(function (k) { return byWeek[k]; });
+    out.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; });
+    var years = U.num(opts.years);
+    if (years && years > 0) {
+      var today = opts.today || U.today();
+      var cutoff = U.addDays(today, -Math.round(years * 365.25));
+      out = out.filter(function (r) { return r[0] >= cutoff; });
+    }
+    return out;
+  }
+
+  /** 'YYYY-MM-DD' 的 ISO 周键（周一为起点），用于按周降采样 */
+  function weekKey(d) {
+    var t = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    var dow = (t.getDay() + 6) % 7;               // 周一=0 … 周日=6
+    t.setDate(t.getDate() - dow);
+    return t.getFullYear() + '-' + U.pad2(t.getMonth() + 1) + '-' + U.pad2(t.getDate());
+  }
+
+  function fetchBenchSevenDay() {
+    return new Promise(function (resolve) {
+      var prev = window.Data_sevenDaysYearIncome;
+      var had = Object.prototype.hasOwnProperty.call(window, 'Data_sevenDaysYearIncome');
+      loadScript(FUND_NAV_URL + BENCH_FUND_CODE + '.js', 'utf-8', PLAN_TIMEOUT, function () {
+        var raw = window.Data_sevenDaysYearIncome;
+        var pts = parseSevenDay(raw, { years: BENCH_KEEP_YEARS, today: U.today() });
+        /* 还原全局，避免污染其它 pingzhongdata 读取 */
+        if (had) window.Data_sevenDaysYearIncome = prev;
+        else { try { delete window.Data_sevenDaysYearIncome; } catch (e) { window.Data_sevenDaysYearIncome = undefined; } }
+        resolve(pts);
+      });
+    }).catch(function () { return []; });
   }
 
   function fetchIndexMinutes(keys) {
@@ -4130,6 +4361,9 @@ XJ.fetcher = (function () {
     parseKlineBars: parseKlineBars,
     fetchKlineBars: fetchKlineBars,
     fetchKlineBundle: fetchKlineBundle,
+    fetchYieldHistory: fetchYieldHistory,
+    parseSevenDay: parseSevenDay,
+    fetchBenchSevenDay: fetchBenchSevenDay,
     parseFundNav: parseFundNav,
     setHistoryProgress: setHistoryProgress,
     fetchIndexHistory: fetchIndexHistory,
@@ -4700,6 +4934,30 @@ XJ.chart = (function () {
 
   var gradSeq = 0;
 
+  /** 两个 'YYYY-MM-DD' 相差几天（用于散点吸附的距离闸门）；无法解析时返回 Infinity */
+  function dayGap(a, b) {
+    var g = U.daysBetween(a, b);
+    return g === null ? Infinity : Math.abs(g);
+  }
+
+  /** 在有序日期数组里找与 d 最接近的下标（二分，找不到返回 -1） */
+  function nearestDateIndex(dates, d) {
+    var n = dates.length;
+    if (!n) return -1;
+    if (d <= dates[0]) return 0;
+    if (d >= dates[n - 1]) return n - 1;
+    var lo = 0, hi = n - 1;
+    while (hi - lo > 1) {
+      var mid = (lo + hi) >> 1;
+      if (dates[mid] <= d) lo = mid; else hi = mid;
+    }
+    /* 谁离得近取谁 —— 必须按「天数」比，直接相减是字符串运算会得到 NaN */
+    return dayGap(dates[lo], d) <= dayGap(dates[hi], d) ? lo : hi;
+  }
+
+  /* 散点吸附的最大容忍天数：超过就不画，避免把十年外的日期吸到曲线最左端 */
+  var MARK_SNAP_DAYS = 7;
+
   /**
    * @param series [{ date:'YYYY-MM-DD', mv:number }] 按日期升序，至少 2 点
    * @param opts   { fmtY, xFormat:'short'|'ymd', xTicks, label }
@@ -4803,6 +5061,8 @@ XJ.chart = (function () {
     var dateSet = {};
     seriesList.forEach(function (s) { s.points.forEach(function (p) { dateSet[p.date] = true; }); });
     if (opts.candles) opts.candles.forEach(function (c) { dateSet[c.date] = true; });
+    /* 注意：散点的日期【不】并入 —— 它们会被吸附到第一条曲线已有的点上（见下），
+       若并进来就等于给它们各开了一格，既毁掉吸附、又让横轴出现非均匀的时间步长。 */
     var dates = Object.keys(dateSet).sort();
     if (dates.length < 2) return '';
     var di = {};
@@ -4825,7 +5085,8 @@ XJ.chart = (function () {
     function py(v) { return y1 - (v - sc.lo) / span * (y1 - y0); }
 
     var gid = 'xjCmp' + (++gradSeq);
-    var svg = '<svg viewBox="0 0 ' + CW + ' ' + CH + '" class="xj-chart xj-cmp" data-chart="cmp"' +
+    var svg = '<svg viewBox="0 0 ' + CW + ' ' + CH + '" class="xj-chart xj-cmp" data-chart="' +
+      esc(opts.chartKey || 'cmp') + '"' +
       ' data-n="' + n + '" data-x0="' + x0 + '" data-x1="' + x1 + '"' +
       ' data-y0="' + y0 + '" data-y1="' + y1 + '" data-lo="' + sc.lo + '" data-hi="' + sc.hi + '"' +
       ' data-cmp="' + esc(JSON.stringify({
@@ -4834,6 +5095,22 @@ XJ.chart = (function () {
         rows: seriesList.map(function (s) {
           var arr = new Array(n);
           s.points.forEach(function (p) { arr[di[p.date]] = p.pct; });
+          /* ★ 前值填充 + 前向回填。
+             横轴是各曲线日期的**并集**（不同市场交易日不同；余额宝基准更是周频），
+             所以某条曲线在别的曲线的日期上一定有点是空的。
+             不填的话拖动读数就是「—」——而曲线明明画着（折线在两点间隐含了前值），
+             看起来就像「这一天没有股息率」，实际只是那天没有观测点。
+             开头那一段没有更早的值可继承，用第一个已知值回填，保证任何一天都有读数。 */
+          var last = null, q;
+          for (q = 0; q < n; q++) {
+            if (arr[q] !== undefined && arr[q] !== null) last = arr[q];
+            else if (last !== null) arr[q] = last;
+          }
+          last = null;
+          for (q = n - 1; q >= 0; q--) {
+            if (arr[q] !== undefined && arr[q] !== null) last = arr[q];
+            else if (last !== null) arr[q] = last;
+          }
           return { name: s.name, color: s.color, vals: arr };
         }),
       })) + '">';
@@ -4881,8 +5158,42 @@ XJ.chart = (function () {
       }).join('');
       if (!d) return;
       svg += '<path d="' + d + '" fill="none" stroke="' + (s.color || '#E8461F') +
-        '" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>';
+        '" stroke-width="' + (s.width || 1.8) + '"' +
+        (s.dash ? ' stroke-dasharray="' + esc(s.dash) + '" stroke-linecap="butt"' : ' stroke-linecap="round"') +
+        ' stroke-linejoin="round"/>';
     });
+
+    /* 散点标记（如「除权除息日」）—— 画在曲线之上、拖动标记之下。
+       每个散点先「吸附」到**第一条曲线上最近的已有日期**，再取该日期的值定位。
+       为什么是「第一条曲线自己的日期」而不是横轴并集：并集里可能混入别的曲线
+       （比如余额宝基准）独有的日期，吸附过去就会取不到值而整个标记消失。
+       这样也保证散点永远落在曲线上，且不会插入非均匀的时间格。
+       吸附距离超过 MARK_SNAP_DAYS 就丢弃，避免把十年外的日期吸到曲线最左端画出假点。 */
+    if (opts.markers && opts.markers.length && seriesList[0]) {
+      var mcolor = opts.markerColor || '#E8862A';
+      var s0 = seriesList[0];
+      var s0dates = s0.points.map(function (p) { return p.date; }).slice().sort();
+      var v0 = {};
+      s0.points.forEach(function (p) { v0[p.date] = p.pct; });
+      var marks = '';
+      var lastDate = s0dates[s0dates.length - 1];
+      opts.markers.forEach(function (m) {
+        var md = typeof m === 'string' ? m : (m && m.date);
+        if (!md) return;
+        /* 晚于曲线最后一天的散点直接丢弃：它会被吸附到最右端，等于把「未来才除权」
+           画成「已经发生过」，是个会误导人的位置错。等那天有价格了再画。 */
+        if (md > lastDate) return;
+        var idx = nearestDateIndex(s0dates, md);
+        if (idx < 0) return;
+        var snapped = s0dates[idx];
+        if (dayGap(snapped, md) > MARK_SNAP_DAYS) return;
+        var val = U.num(v0[snapped]);
+        if (val === null) return;
+        marks += '<circle cx="' + px(di[snapped]).toFixed(1) + '" cy="' + py(val).toFixed(1) +
+          '" r="3.1" fill="' + mcolor + '"/>';
+      });
+      if (marks) svg += '<g class="xjc-marks">' + marks + '</g>';
+    }
 
     /* 横轴日期 */
     var want = opts.xTicks || 4;
@@ -4911,7 +5222,7 @@ XJ.chart = (function () {
     seriesList.forEach(function (s) {
       /* 名字（最多显示 6 字）+ 数值（按最长的可能形态估） */
       var nmW = estW(String(s.name || '').slice(0, 6), 9.5);
-      var valW = estW(opts.unit === '%' ? '-000.00%' : '-¥0,000,000', 9.5);
+      var valW = estW(opts.unit === 'money' ? '-¥0,000,000' : '-000.00%', 9.5);
       bubW = Math.max(bubW, 21 + nmW + 16 + valW + 11);
     });
     var bubH = seriesList.length * rowH + 16;
@@ -4933,6 +5244,134 @@ XJ.chart = (function () {
 
     svg += '</svg>';
     return svg;
+  }
+
+  /* ---------------- 时间范围选择条（brush） ----------------
+   * 参考图底部那条：一条概览曲线 + 左右两个抓手指明当前可见区间。
+   *
+   * 为什么独立成第二个 <svg> 而不是画进主图：
+   *   1) 拖动时要实时重画主图。若抓手和主图同在一个 <svg> 里，
+   *      重画 innerHTML 会把抓手自身也删掉，正在进行的 pointer capture 随之中断、手势直接断；
+   *   2) 完全不用去动主图 CPR / CPB 的底部留白与 px/py 坐标换算。
+   *
+   * BG_LABEL_Y 之上是两端日期标签（与参考图一致：日期在主图与概览条之间）。
+   */
+  var BW = 360, BH = 54;
+  var B_LABEL_Y = 9, B_TOP = 18, B_BOT = 50;
+  var B_HANDLE_W = 15, B_HANDLE_H = 22, B_MIN_SPAN = 2;
+
+  /* 渲染输入按 chartKey 存一份：brush 拖动时要据此切片重画主图。
+     不放在 DOM 的 data-* 里 —— 十年 × 多列的 JSON 塞进属性既慢又易踩转义坑。 */
+  var brushReg = {};
+
+  function brushX(idx, n) { return n > 1 ? (idx / (n - 1)) * BW : BW / 2; }
+
+  function handleMarkup(side) {
+    var s = '<g class="xjc-brush-h" data-side="' + side + '">' +
+      '<rect x="' + (-B_HANDLE_W / 2) + '" y="' + (-B_HANDLE_H / 2) + '" width="' + B_HANDLE_W + '" height="' + B_HANDLE_H +
+      '" rx="5" fill="#FFFFFF" stroke="#D8DCE3" stroke-width="1" vector-effect="non-scaling-stroke"/>';
+    /* 参考图抓手上的「III」三道竖线 */
+    [-3, 0, 3].forEach(function (dx) {
+      s += '<line x1="' + dx + '" y1="-5" x2="' + dx + '" y2="5" stroke="#B9BFC9" stroke-width="1.4" ' +
+        'stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
+    });
+    return s + '</g>';
+  }
+
+  /**
+   * @param points [{date, y}] 概览用的全量序列（升序，至少 2 点）
+   * @param opts   { chartKey, begIdx, endIdx, onChange(begDate, endDate, isFinal), color }
+   * @return SVG 字符串；points 不足时返回 ''
+   */
+  function brush(points, opts) {
+    opts = opts || {};
+    var list = (points || []).filter(function (p) { return p && p.date && U.num(p.y) !== null; });
+    if (list.length < 2) return '';
+    var key = opts.chartKey || 'cmp';
+    var n = list.length;
+    var i0 = Math.max(0, Math.min(n - 1, U.num(opts.begIdx) === null ? 0 : Math.round(U.num(opts.begIdx))));
+    var i1 = Math.max(0, Math.min(n - 1, U.num(opts.endIdx) === null ? n - 1 : Math.round(U.num(opts.endIdx))));
+    if (i1 - i0 < B_MIN_SPAN) i1 = Math.min(n - 1, i0 + B_MIN_SPAN);
+    if (i1 - i0 < B_MIN_SPAN) i0 = Math.max(0, i1 - B_MIN_SPAN);
+
+    brushReg[key] = { points: list, opts: opts };
+
+    var vals = list.map(function (p) { return U.num(p.y) || 0; });
+    var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    var span = (hi - lo) || Math.max(Math.abs(hi) * 0.001, 1e-6);
+    function by(v) { return B_BOT - ((v - lo) / span) * (B_BOT - B_TOP); }
+
+    var line = '';
+    for (var k = 0; k < n; k++) {
+      line += (k ? 'L' : 'M') + brushX(k, n).toFixed(1) + ' ' + by(vals[k]).toFixed(1);
+    }
+    var area = line + ' L' + BW + ' ' + B_BOT + ' L0 ' + B_BOT + ' Z';
+    var color = opts.color || '#7FA6D9';
+    var xa0 = brushX(i0, n), xb0 = brushX(i1, n);
+
+    var svg = '<svg viewBox="0 0 ' + BW + ' ' + BH + '" class="xj-brush" data-brush="' + esc(key) +
+      '" data-n="' + n + '">' +
+      '<text class="xjc-brush-beg" x="0" y="' + B_LABEL_Y + '" font-size="10.5" fill="#8E8E93">' +
+      esc(list[i0].date) + '</text>' +
+      '<text class="xjc-brush-end" x="' + BW + '" y="' + B_LABEL_Y +
+      '" font-size="10.5" fill="#8E8E93" text-anchor="end">' + esc(list[i1].date) + '</text>' +
+      '<rect x="0" y="' + B_TOP + '" width="' + BW + '" height="' + (B_BOT - B_TOP) +
+      '" rx="7" fill="#F0F4FA"/>' +
+      '<path d="' + area + '" fill="' + color + '" fill-opacity="0.34"/>' +
+      /* 选中区间之外压一层浅色蒙版（参考图就是这个效果） */
+      '<rect class="xjc-brush-mask" data-side="l" x="0" y="' + B_TOP + '" width="' + xa0.toFixed(1) +
+      '" height="' + (B_BOT - B_TOP) + '" fill="#F7F8FA" fill-opacity="0.78"/>' +
+      '<rect class="xjc-brush-mask" data-side="r" x="' + xb0.toFixed(1) + '" y="' + B_TOP + '" width="' +
+      Math.max(0, BW - xb0).toFixed(1) + '" height="' + (B_BOT - B_TOP) + '" fill="#F7F8FA" fill-opacity="0.78"/>' +
+      '<rect class="xjc-brush-sel" x="' + xa0.toFixed(1) + '" y="' + (B_TOP - 1) + '" width="' +
+      Math.max(0, xb0 - xa0).toFixed(1) + '" height="' + (B_BOT - B_TOP + 2) +
+      '" fill="none" stroke="#C3D3EA" stroke-width="1" rx="6" vector-effect="non-scaling-stroke"/>' +
+      '<g class="xjc-brush-hl" data-side="l" transform="translate(' + xa0.toFixed(1) + ',' + ((B_TOP + B_BOT) / 2) + ')">' +
+      handleMarkup('l') + '</g>' +
+      '<g class="xjc-brush-hr" data-side="r" transform="translate(' + xb0.toFixed(1) + ',' + ((B_TOP + B_BOT) / 2) + ')">' +
+      handleMarkup('r') + '</g>' +
+      '</svg>';
+    return svg;
+  }
+
+  /** 依据当前 i0/i1 就地更新 brush 的抓手/蒙版/日期标签（不重画整个 SVG，保住 pointer capture） */
+  function paintBrush(svg, i0, i1) {
+    var key = svg.getAttribute('data-brush');
+    var reg = brushReg[key];
+    if (!reg) return;
+    var n = reg.points.length;
+    var xa = brushX(i0, n), xb = brushX(i1, n);
+    var hl = svg.querySelector('.xjc-brush-hl'), hr = svg.querySelector('.xjc-brush-hr');
+    var yMid = (B_TOP + B_BOT) / 2;
+    if (hl) hl.setAttribute('transform', 'translate(' + xa.toFixed(1) + ',' + yMid + ')');
+    if (hr) hr.setAttribute('transform', 'translate(' + xb.toFixed(1) + ',' + yMid + ')');
+    var ml = svg.querySelector('.xjc-brush-mask[data-side="l"]');
+    var mr = svg.querySelector('.xjc-brush-mask[data-side="r"]');
+    if (ml) ml.setAttribute('width', Math.max(0, xa).toFixed(1));
+    if (mr) { mr.setAttribute('x', xb.toFixed(1)); mr.setAttribute('width', Math.max(0, BW - xb).toFixed(1)); }
+    var sel = svg.querySelector('.xjc-brush-sel');
+    if (sel) { sel.setAttribute('x', xa.toFixed(1)); sel.setAttribute('width', Math.max(0, xb - xa).toFixed(1)); }
+    var beg = svg.querySelector('.xjc-brush-beg'), end = svg.querySelector('.xjc-brush-end');
+    if (beg) beg.textContent = reg.points[i0] ? reg.points[i0].date : '';
+    if (end) end.textContent = reg.points[i1] ? reg.points[i1].date : '';
+  }
+
+  /** 把 brush 的当前选区回调出去（拖动中 isFinal=false，松手 isFinal=true） */
+  function emitBrush(svg, i0, i1, isFinal) {
+    var reg = brushReg[svg.getAttribute('data-brush')];
+    if (!reg || typeof reg.opts.onChange !== 'function') return;
+    var a = reg.points[i0], b = reg.points[i1];
+    if (!a || !b) return;
+    reg.opts.onChange(a.date, b.date, !!isFinal);
+  }
+
+  /** 点到 x 比例 → 最近的概览下标 */
+  function brushIndexAt(svg, clientX) {
+    var rect = svg.getBoundingClientRect();
+    var ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+    ratio = ratio < 0 ? 0 : ratio > 1 ? 1 : ratio;
+    var n = +svg.getAttribute('data-n') || 2;
+    return Math.round(ratio * (n - 1));
   }
 
   /* ---------------- 分时走势（持仓卡片内的小图） ----------------
@@ -5026,6 +5465,7 @@ XJ.chart = (function () {
       var valEl = node.querySelector('.xjc-cmpv');
       nameEl.textContent = row.name;
       if (v === null || v === undefined) valEl.textContent = '—';
+      else if (unit === 'yield') valEl.textContent = Number(v).toFixed(2) + '%';
       else if (unit === '%') valEl.textContent = (v > 0 ? '+' : '') + Number(v).toFixed(2) + '%';
       /* 金额用紧凑写法（¥12.35万），避免大额数字把气泡撑爆或反过来被截断 */
       else valEl.textContent = (v < 0 ? '-¥' : '¥') + U.moneyCompact(Math.abs(v));
@@ -5088,12 +5528,64 @@ XJ.chart = (function () {
     else showAt(svg, i);
   }
 
+  /* ---------------- brush 拖动状态 ----------------
+   * mode:'l' | 'r' 拖某一端；mode:'pan' 整体平移。
+   * 拖动中只改 SVG 属性 + 回调（不碰 store），松手才把 isFinal=true 交出去。 */
+  var brushDrag = null;
+
+  function brushState(svg) {
+    return brushReg[svg.getAttribute('data-brush')] || null;
+  }
+
+  function applyBrush(svg, i0, i1, isFinal) {
+    var reg = brushState(svg);
+    if (!reg) return;
+    var n = reg.points.length;
+    i0 = Math.max(0, Math.min(n - 1, i0));
+    i1 = Math.max(0, Math.min(n - 1, i1));
+    if (i1 - i0 < B_MIN_SPAN) {
+      if (isFinal || i1 === n - 1) i0 = Math.max(0, i1 - B_MIN_SPAN);
+      else i1 = Math.min(n - 1, i0 + B_MIN_SPAN);
+    }
+    paintBrush(svg, i0, i1);
+    emitBrush(svg, i0, i1, isFinal);
+  }
+
   function bind() {
     if (bound) return;
     bound = true;
 
     document.addEventListener('pointerdown', function (e) {
       var t = e.target;
+      /* brush 必须抢在主图之前分流：它的 SVG 只有 data-brush 没有 data-chart，
+         若走下面那条分支会被当成「点图表外」直接忽略掉。 */
+      var bsvg = t && t.closest ? t.closest('svg[data-brush]') : null;
+      if (bsvg) {
+        var reg = brushState(bsvg);
+        if (reg) {
+          var n = reg.points.length;
+          var idx = brushIndexAt(bsvg, e.clientX);
+          var cur = curBrushIdx(bsvg);
+          /* 抓手判定要同时认「内层 <g class="xjc-brush-h">」与「外层定位 <g class="xjc-brush-hl/hr">」——
+             真实点击落在内层的 rect/line 上、closest 能上溯到 xjc-brush-h；
+             但若事件正是打在外层 wrapper 上（测试里就是这样），closest('.xjc-brush-h') 匹配不到，
+             会静默退化成「就近选一端」，窄选区时就会抓错边。所以两边都认，并用 data-side 定方向。 */
+          var handle = t.closest
+            ? (t.closest('.xjc-brush-h') || t.closest('.xjc-brush-hl') || t.closest('.xjc-brush-hr'))
+            : null;
+          var mode;
+          if (handle) mode = handle.getAttribute('data-side') === 'l' ? 'l' : 'r';
+          else if (t.closest && t.closest('.xjc-brush-sel')) mode = 'pan';
+          else mode = (Math.abs(idx - cur[0]) <= Math.abs(idx - cur[1])) ? 'l' : 'r';
+          brushDrag = { svg: bsvg, key: bsvg.getAttribute('data-brush'), mode: mode,
+            grabIdx: idx, begIdx: cur[0], endIdx: cur[1], moved: false };
+          try { bsvg.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+          hideAll();
+          active = null;
+          e.preventDefault();
+          return;
+        }
+      }
       var svg = t && t.closest ? t.closest('svg[data-chart]') : null;
       if (!svg) { hideAll(); active = null; return; }     // 点图表外 → 收起
       active = svg;
@@ -5103,19 +5595,79 @@ XJ.chart = (function () {
     }, { passive: false });
 
     document.addEventListener('pointermove', function (e) {
+      if (brushDrag) {
+        /* 拖动中途若发生整页重渲染（离线时失败的行情请求会 notify()），
+           手上的 SVG 会脱离文档 —— 按 chartKey 把它找回来继续拖，别让手势断掉。
+           重新找回时选区以 ui 里记着的范围为准（视图层每次变化都会同步过去）。 */
+        if (!document.body.contains(brushDrag.svg)) {
+          var again = document.querySelector('svg[data-brush="' + brushDrag.key + '"]');
+          if (!again) { brushDrag = null; return; }
+          var back = curBrushIdx(again);
+          brushDrag.svg = again;
+          brushDrag.begIdx = back[0];
+          brushDrag.endIdx = back[1];
+        }
+        var d = brushDrag;
+        var i = brushIndexAt(d.svg, e.clientX);
+        if (i !== d.grabIdx) d.moved = true;
+        if (d.mode === 'pan') {
+          var n = brushState(d.svg) ? brushState(d.svg).points.length : 0;
+          var span = d.endIdx - d.begIdx;
+          var delta = i - d.grabIdx;
+          var b = Math.max(0, Math.min(n - 1 - span, d.begIdx + delta));
+          applyBrush(d.svg, b, b + span, false);
+        } else if (d.mode === 'l') {
+          applyBrush(d.svg, Math.min(i, d.endIdx - 1), d.endIdx, false);
+        } else {
+          applyBrush(d.svg, d.begIdx, Math.max(i, d.begIdx + 1), false);
+        }
+        e.preventDefault();
+        return;
+      }
       if (!active || !document.body.contains(active)) return;
       showAnyAt(active, locate(active, e.clientX));
       e.preventDefault();
     }, { passive: false });
 
     /* 抬起后**保留**读数（同花顺也是抬起后仍显示），点别处才收起 */
-    document.addEventListener('pointerup', function () { active = null; });
-    document.addEventListener('pointercancel', function () { active = null; });
+    document.addEventListener('pointerup', function () {
+      if (brushDrag) {
+        var d = brushDrag;
+        brushDrag = null;
+        var cur = curBrushIdx(d.svg);
+        applyBrush(d.svg, cur[0], cur[1], true);   // 松手才把结果提交出去
+        return;
+      }
+      active = null;
+    });
+    document.addEventListener('pointercancel', function () {
+      if (brushDrag) { brushDrag = null; return; }
+      active = null;
+    });
+  }
+
+  /** 读 brush 当前选区下标（从 DOM 反推，避免另存一份状态导致不同步） */
+  function curBrushIdx(svg) {
+    var reg = brushState(svg);
+    var n = reg ? reg.points.length : 2;
+    var hl = svg.querySelector('.xjc-brush-hl'), hr = svg.querySelector('.xjc-brush-hr');
+    function idxOf(node) {
+      if (!node) return null;
+      var m = /translate\(\s*([-\d.]+)/.exec(node.getAttribute('transform') || '');
+      if (!m) return null;
+      var x = U.num(m[1]);
+      if (x === null || n < 2) return null;
+      return Math.round(x / BW * (n - 1));
+    }
+    var a = idxOf(hl), b = idxOf(hr);
+    if (a === null) a = 0;
+    if (b === null) b = n - 1;
+    return [Math.max(0, Math.min(n - 1, a)), Math.max(0, Math.min(n - 1, b))];
   }
 
   return {
     render: render, renderCompare: renderCompare, sparkline: sparkline,
-    bind: bind, niceScale: niceScale, hideAll: hideAll,
+    brush: brush, bind: bind, niceScale: niceScale, hideAll: hideAll,
   };
 })();
 
@@ -5259,6 +5811,189 @@ XJ.calc = (function () {
     var latest = impl.slice().sort(function (a, b2) { return a.reportDate < b2.reportDate ? 1 : -1; })[0];
     var single = perSharePretax(latest);
     return { perShare: single, total: single, basis: 'single', year: reportYear(latest), years: 0 };
+  }
+
+  /* ---------------- 股息率曲线（财年口径） ----------------
+   * 口径：某时点的股息率 = 该财年派现总额 ÷ 当时总市值 × 100%
+   *                       = 该财年每股派现合计 ÷ 当时股价 × 100%
+   * （总股本在分子分母中约掉；历史时点的总股本拿不到，且这与东财 DIVIDENT_RATIO 同一口径。）
+   *
+   * 与 annualBasePerShare 的两个关键差别：
+   *   1) 分子**含已公告的预案**（不过滤 isImplemented）—— 因为生效时点选的是「预案公告日」，
+   *      若只算已实施，公告日切换就形同虚设（要等 2~3 个月后的除权除息日才生效）。
+   *   2) 只认**含年报**的财年：「上一年财报」指年报，光有中报不足以为一个财年定调。
+   */
+
+  /**
+   * 财年分子表。返回 [{ year, perShare, effectiveFrom, annualPlans }]，按 year 升序。
+   *   year          报告年度
+   *   perShare      该财年【全部】方案的每股税前派现合计（含中报/季报，含预案）
+   *   effectiveFrom 该财年的生效日 = 年报方案的预案公告日
+   *                 （退化为 noticeDate → equityRecordDate → exDividendDate；全缺则不入选）
+   *   annualPlans   该财年的年报方案条数
+   */
+  function yieldFiscalSteps(plans) {
+    var byYear = {};
+    (plans || []).forEach(function (p) {
+      if (!p) return;
+      var y = reportYear(p);
+      if (!y) return;
+      if (!byYear[y]) byYear[y] = { sum: 0, annual: [] };
+      byYear[y].sum += perSharePretax(p);
+      if (isAnnualReport(p)) byYear[y].annual.push(p);
+    });
+
+    var out = [];
+    Object.keys(byYear).forEach(function (key) {
+      var y = U.num(key);
+      var g = byYear[key];
+      if (!y || !g.annual.length) return;          // 没有年报的财年不作候选
+      if (!(g.sum > 0)) return;                    // 该财年一分钱都没派 → 不参与（股息率 0 无意义）
+      /* 生效日取该财年最早一条年报方案的公告日；缺则沿退化链往下找 */
+      var best = null;
+      g.annual.forEach(function (p) {
+        var d = p.planNoticeDate || p.noticeDate || p.equityRecordDate || p.exDividendDate || null;
+        if (!d) return;
+        if (!best || d < best) best = d;
+      });
+      if (!best) return;                           // 连公告日都拿不到 → 无法定生效时点
+      out.push({ year: y, perShare: g.sum, effectiveFrom: best, annualPlans: g.annual.length });
+    });
+
+    out.sort(function (a, b) { return a.year - b.year; });
+    return out;
+  }
+
+  /**
+   * 股息率时间序列。
+   * @param plans  该标的的全部 DividendPlan（含预案）
+   * @param closes [['YYYY-MM-DD', close], ...] 升序（不复权收盘价）
+   * @return [{ date, y, year }] —— y 为百分比；生效日之前的点不产出（曲线自然从第一个财年起）
+   *
+   * 用双指针推进财年，整体 O(n+m)。分子在一年内是常数，只有到了下一年报预案公告日才跳一次 ——
+   * 所以曲线上的「台阶」位置就是各年年报的公告日，这是符合预期且可验证的。
+   */
+  function dividendYieldSeries(plans, closes) {
+    var steps = yieldFiscalSteps(plans);
+    if (!steps.length) return [];
+    var list = closes || [];
+    var out = [];
+    var si = -1;                                   // 当前生效的财年下标
+    for (var i = 0; i < list.length; i++) {
+      var row = list[i];
+      if (!row || row.length < 2) continue;
+      var d = String(row[0]).slice(0, 10);
+      var c = U.num(row[1]);
+      if (c === null || !(c > 0)) continue;
+      /* 把所有「生效日 <= 当天」的财年都吃掉，最后一个即为当前生效的 */
+      while (si + 1 < steps.length && steps[si + 1].effectiveFrom <= d) si++;
+      if (si < 0) continue;                        // 还没到任何一个财年的生效日
+      var s = steps[si];
+      out.push({ date: d, y: s.perShare / c * 100, year: s.year });
+    }
+    return out;
+  }
+
+  /* ---------------- 平均股息率线（分财年） ----------------
+   *
+   * 为什么必须「分财年」而不是全期一个均值：
+   * 一个财年窗口内分子（每股派现合计）是常数，所以「该财年的平均股息率」完全由价格决定，
+   * 于是「高于 / 低于均线」才能被读成估值位置的相对高低。
+   * 若改用全期单一均值（方案A），均线的高/低于就被分子档位锁死 ——
+   * 实测中远海控 2022-01-01 起 1142 个交易日里，只有 FY2022 那 241 天高于全期均值、
+   * 其余 901 天恒为「低于」，穿越次数仅 2 次，信号等于失效。
+   * （对照：分财年口径下同一标的穿越 54 次。）
+   */
+
+  /** 平均股息率线的样本起点（用户定：日历年 2022-01-01 起） */
+  var YIELD_AVG_FROM = '2022-01-01';
+  /** 整年窗口口径的最小样本量：不足则该财年段整段不画。120 个交易日 ≈ 半年。 */
+  var YIELD_AVG_MIN_DAYS = 120;
+
+  /**
+   * 分财年平均股息率（统计口径，供界面读文案用）。
+   *
+   * @param plans  该标的的全部 DividendPlan
+   * @param closes [['YYYY-MM-DD', close], ...] 升序
+   * @return [{ year, perShare, from, to, days, avg, ok }]
+   *         avg 为百分比；ok=false 表示样本 < YIELD_AVG_MIN_DAYS（界面据此提示、不绘制）
+   *
+   * 样本一律从 YIELD_AVG_FROM 起算，所以跨 2022 年初的那个财年只取到后半段
+   * （长江电力 FY2020 只剩 77 天 → ok=false → 不画）。
+   */
+  function yieldYearAverages(plans, closes) {
+    var shareOf = {};
+    yieldFiscalSteps(plans).forEach(function (s) { shareOf[s.year] = s.perShare; });
+
+    var out = [];
+    var cur = null;
+    dividendYieldSeries(plans, closes).forEach(function (p) {
+      if (p.date < YIELD_AVG_FROM) return;
+      /* 财年档沿时间单调递增（steps 按 year 排序、effectiveFrom 随之递增），
+         所以按「相邻不同年」切段是安全的，同一年不会分成两段。 */
+      if (!cur || cur.year !== p.year) {
+        cur = { year: p.year, sum: 0, days: 0, from: p.date, to: p.date };
+        out.push(cur);
+      }
+      cur.sum += p.y; cur.days++; cur.to = p.date;
+    });
+
+    out.forEach(function (g) {
+      g.avg = g.days ? g.sum / g.days : null;
+      g.perShare = shareOf[g.year] === undefined ? null : shareOf[g.year];
+      g.ok = g.days >= YIELD_AVG_MIN_DAYS;
+    });
+    return out;
+  }
+
+  /**
+   * 平均股息率线（可直接画进图表的点序列，与股息率曲线同轴）。
+   *
+   * mode='year' 该财年【整段窗口】的均值 → 每财年一条水平线（阶梯）；
+   *             样本不足的财年整段不画（避免用半年的样本冒充一年的水平）。
+   * mode='cum'  从该财年生效日起【逐日累积】的均值 → 是个爬升的曲线，
+   *             无前视偏差（只用当日及之前的样本），所以**不设样本门槛** ——
+   *             「样本少所以均值不可信」正是它要如实反映的东西。
+   *
+   * 两种口径都只在【该财年窗口内】取样本，因此均线的起伏只由价格产生；
+   * 差别仅在于「是否用到了本财年后面才发生的价格」。
+   *
+   * @return [{ date, y, year, enough }] —— y 为百分比
+   */
+  function yieldAverageSeries(plans, closes, mode) {
+    var cum = mode === 'cum';
+    var avgOf = {}, okOf = {};
+    yieldYearAverages(plans, closes).forEach(function (g) {
+      avgOf[g.year] = g.avg; okOf[g.year] = g.ok;
+    });
+
+    var out = [];
+    var cur = null;
+    dividendYieldSeries(plans, closes).forEach(function (p) {
+      if (p.date < YIELD_AVG_FROM) return;
+      if (!cur || cur.year !== p.year) cur = { year: p.year, sum: 0, days: 0 };
+      cur.sum += p.y; cur.days++;
+      if (cum) {
+        out.push({ date: p.date, y: cur.sum / cur.days, year: p.year, enough: true });
+        return;
+      }
+      if (!okOf[p.year]) return;
+      out.push({ date: p.date, y: avgOf[p.year], year: p.year, enough: true });
+    });
+    return out;
+  }
+
+  /** 除权除息日清单（升序、去重），供曲线打散点用 */
+  function exDividendDates(plans) {
+    var seen = {};
+    (plans || []).forEach(function (p) {
+      var d = p && p.exDividendDate;
+      if (!d) return;
+      d = String(d).slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+      seen[d] = 1;
+    });
+    return Object.keys(seen).sort();
   }
 
   /* ---------------- 持仓成本 ---------------- */
@@ -5424,6 +6159,20 @@ XJ.calc = (function () {
       var since = buys.length ? buys[0] : null;
       var holdDays = since ? Math.max(0, U.daysBetween(since, today) || 0) : 0;
 
+      /* ---- 人民币口径的「金额」字段 ----
+         应用的主口径是人民币：首页总市值、资产走势曲线、每日快照用的都是折算后的值。
+         这里把金额类字段一并折好，避免「有的地方折、有的地方不折」——
+         曾经 summary() 把港币金额当人民币直接相加，而曲线是折过的，
+         结果同一个组合出现两个总市值（实测 40,000 vs 37,600）。
+         ★ **原币字段全部保留不动**：buildSnapshot / netWorthAdjust / alignMinute 里
+         已经各自做过折算，改这里会导致重复折算；而且 position() 的分红摊薄要用原币的分红合计。
+         ★ **每股数字（price / avgCost / prevClose）不折**：港股的价格本来就是港元，
+         折了反而与行情软件对不上。 */
+      var rate = fxRate(XJ.market.currency(sym), (state.settings && state.settings.fx) || {});
+      var marketValueCny = marketValue === null ? null : marketValue * rate;
+      var costValueCny = costValue * rate;
+      var unrealizedCny = marketValue === null ? null : marketValueCny - costValueCny;
+
       rows.push({
         symbol: sym,
         code: XJ.model.codeOf(sym),
@@ -5454,6 +6203,15 @@ XJ.calc = (function () {
         unrealized: unrealized,
         unrealizedPct: unrealizedPct,
         realized: pos.realized,
+        /* 人民币口径（汇总与界面显示 ¥ 时一律用这几个；原币字段供内部折算复用） */
+        fxRate: rate,
+        marketValueCny: marketValueCny,
+        costValueCny: costValueCny,
+        unrealizedCny: unrealizedCny,
+        realizedCny: pos.realized * rate,
+        netInvestedCny: netInvested * rate,
+        receivedTotalCny: recvTotal * rate,
+        predictedDividendCny: predictedDividend * rate,
         perShareTTM: ttm,
         dividendYield: dividendYield,
         annualPerShare: annual.perShare,
@@ -5467,6 +6225,8 @@ XJ.calc = (function () {
         marketYield: marketYield,
         receivedTotal: recvTotal,
         remaining: remaining,
+        /* 人民币口径的「剩余待回收」= 净投入 − 已收分红（与上面同源，只是换算单位） */
+        remainingCny: Math.max(0, netInvested * rate - recvTotal * rate),
         recoveryPct: recoveryPct,
         expectedYears: expectedYears,
         holdDays: holdDays,
@@ -5494,22 +6254,32 @@ XJ.calc = (function () {
     var totalMarketValue = 0, totalCost = 0, totalPredicted = 0,
       totalRealized = 0, missingQuote = 0;
 
+    /* ★ 一律用人民币口径的字段（holdings 里已按各标的币种折好）。
+       早先这里直接累加 h.marketValue / h.costValue（原币），
+       持有港股/美股的组合会把外币金额当人民币相加，而资产走势曲线与每日快照是折过的
+       → 同一个组合、同一个界面出现两个总市值。 */
     hs.forEach(function (h) {
-      totalCost += h.costValue;
-      totalPredicted += h.predictedDividend;
-      totalRealized += h.realized;
+      totalCost += h.costValueCny;
+      totalPredicted += h.predictedDividendCny;
+      totalRealized += h.realizedCny;
       if (h.marketValue === null) missingQuote++;
-      else totalMarketValue += h.marketValue;
+      else totalMarketValue += h.marketValueCny;
     });
+
+    /* 分红同样按「该标的的币种」折算（港币分红不能当人民币加） */
+    var fxNow = (state.settings && state.settings.fx) || {};
+    var recvCny = function (r) {
+      return U.n0(r.amount) * fxRate(XJ.market.currency(r.symbol), fxNow);
+    };
 
     var receivedThisYear = U.sum(state.received.filter(function (r) {
       if (acc !== ALL && r.accountId !== acc) return false;
       return (r.year || U.yearOf(r.exDividendDate)) === curYear;
-    }), function (r) { return r.amount; });
+    }), recvCny);
 
     var receivedTotal = U.sum(state.received.filter(function (r) {
       return acc === ALL || r.accountId === acc;
-    }), function (r) { return r.amount; });
+    }), recvCny);
 
     var compositeYield = totalMarketValue > 0 ? totalPredicted / totalMarketValue * 100 : null;
 
@@ -5518,15 +6288,15 @@ XJ.calc = (function () {
 
     /* 净投入（摊薄口径的累计投入） */
     var totalNetInvested = 0;
-    /* 单只平均市值、按资产类型分组 */
+    /* 单只平均市值、按资产类型分组（人民币口径） */
     var byAssetType = {};
     hs.forEach(function (h) {
-      totalNetInvested += h.netInvested || 0;
+      totalNetInvested += h.netInvestedCny;
       var k = h.assetType || 'stock';
       var g = byAssetType[k] || (byAssetType[k] = { key: k, label: h.kindLabel, count: 0, marketValue: 0, predicted: 0 });
       g.count++;
-      g.marketValue += (h.marketValue || 0);
-      g.predicted += (h.predictedDividend || 0);
+      g.marketValue += (h.marketValueCny || 0);
+      g.predicted += (h.predictedDividendCny || 0);
     });
     var assetTypeList = Object.keys(byAssetType)
       .map(function (k) { return byAssetType[k]; })
@@ -6080,8 +6850,8 @@ XJ.calc = (function () {
 
     /* 盈亏榜 */
     var byPnl = hs.slice()
-      .filter(function (h) { return h.unrealized !== null; })
-      .sort(function (a, b) { return b.unrealized - a.unrealized; });
+      .filter(function (h) { return h.unrealizedCny !== null; })
+      .sort(function (a, b) { return b.unrealizedCny - a.unrealizedCny; });
 
     /* 股息率分层 */
     var buckets = [
@@ -6102,9 +6872,9 @@ XJ.calc = (function () {
         if (y >= buckets[buckets.length - 2].min) b = buckets[buckets.length - 2];
       }
       b.count++;
-      b.marketValue += (h.marketValue || 0);
+      b.marketValue += (h.marketValueCny || 0);
       b.stocks.push({
-        symbol: h.symbol, name: h.name, marketValue: h.marketValue || 0,
+        symbol: h.symbol, name: h.name, marketValue: h.marketValueCny || 0,
         dividendYield: (y === null || y === undefined || isNaN(y)) ? null : y,
       });
     });
@@ -6120,9 +6890,9 @@ XJ.calc = (function () {
         key: k, label: h.kindLabel, count: 0, marketValue: 0, predicted: 0, stocks: [],
       });
       g.count++;
-      g.marketValue += (h.marketValue || 0);
-      g.predicted += (h.predictedDividend || 0);
-      g.stocks.push({ symbol: h.symbol, name: h.name, marketValue: h.marketValue || 0 });
+      g.marketValue += (h.marketValueCny || 0);
+      g.predicted += (h.predictedDividendCny || 0);
+      g.stocks.push({ symbol: h.symbol, name: h.name, marketValue: h.marketValueCny || 0 });
     });
     var byAssetType = Object.keys(assetMap).map(function (k) { return assetMap[k]; })
       .sort(function (a, b) { return b.marketValue - a.marketValue; });
@@ -6135,29 +6905,29 @@ XJ.calc = (function () {
       });
     });
 
-    /* 集中度 */
+    /* 集中度（人民币口径：原币混币排序会让港股/美股的名次与占比都失真） */
     var sorted = hs.slice().sort(function (a, b) {
-      return (b.marketValue || 0) - (a.marketValue || 0);
+      return (b.marketValueCny || 0) - (a.marketValueCny || 0);
     });
-    var totalMv = U.sum(sorted, function (h) { return h.marketValue || 0; });
+    var totalMv = U.sum(sorted, function (h) { return h.marketValueCny || 0; });
     function topShare(n) {
       return totalMv > 0
-        ? U.sum(sorted.slice(0, n), function (h) { return h.marketValue || 0; }) / totalMv * 100
+        ? U.sum(sorted.slice(0, n), function (h) { return h.marketValueCny || 0; }) / totalMv * 100
         : null;
     }
     var hhi = totalMv > 0
-      ? U.sum(sorted, function (h) { var w = (h.marketValue || 0) / totalMv; return w * w; })
+      ? U.sum(sorted, function (h) { var w = (h.marketValueCny || 0) / totalMv; return w * w; })
       : null;
     var level = hhi === null ? '—' : hhi >= 0.25 ? '高度集中' : hhi >= 0.15 ? '较为集中' : '相对分散';
 
     /* 逐只集中度（含累计占比，让用户看清前三大到底是哪三只） */
     var cum = 0;
     var concentrationList = sorted.map(function (h, i) {
-      var w = totalMv > 0 ? (h.marketValue || 0) / totalMv * 100 : 0;
+      var w = totalMv > 0 ? (h.marketValueCny || 0) / totalMv * 100 : 0;
       cum += w;
       return {
         rank: i + 1, symbol: h.symbol, name: h.name,
-        marketValue: h.marketValue || 0, weight: w, cumWeight: cum,
+        marketValue: h.marketValueCny || 0, weight: w, cumWeight: cum,
       };
     });
 
@@ -6165,7 +6935,7 @@ XJ.calc = (function () {
       summary: s,
       byPnl: byPnl,
       topGainers: byPnl.slice(0, 5),
-      topLosers: byPnl.slice(-5).filter(function (h) { return h.unrealized < 0; }).reverse(),
+      topLosers: byPnl.slice(-5).filter(function (h) { return h.unrealizedCny < 0; }).reverse(),
       yieldBuckets: buckets,
       byAssetType: byAssetType,
       concentration: {
@@ -6175,8 +6945,8 @@ XJ.calc = (function () {
         /* 逐只占比 + 累计占比，用于在界面上具体列出每只股票 */
         holdings: concentrationList,
       },
-      lossCount: byPnl.filter(function (h) { return h.unrealized < 0; }).length,
-      gainCount: byPnl.filter(function (h) { return h.unrealized > 0; }).length,
+      lossCount: byPnl.filter(function (h) { return h.unrealizedCny < 0; }).length,
+      gainCount: byPnl.filter(function (h) { return h.unrealizedCny > 0; }).length,
     };
   }
 
@@ -6298,6 +7068,14 @@ XJ.calc = (function () {
     if (currency === 'HKD') return U.num(fx && fx.HKD) || 1;
     if (currency === 'USD') return U.num(fx && fx.USD) || 1;
     return 1;
+  }
+
+  /**
+   * 某标的的「原币 → 人民币」汇率。
+   * 视图层要显示 ¥ 金额（分红记录、明细行等）时统一走这里，避免各处自己取汇率取错。
+   */
+  function cnyRateOf(state, symbol) {
+    return fxRate(XJ.market.currency(symbol), (state && state.settings && state.settings.fx) || {});
   }
 
   /**
@@ -7019,6 +7797,41 @@ XJ.calc = (function () {
     return { points: out, missing: missing };
   }
 
+  /**
+   * 当日净资产曲线要加的**常量项**（盘口无关，全天不变）：
+   *   累计已收分红 − 累计净投入 + 没有分时的那些标的的静态市值
+   *
+   * ★ 必须与 marketValueSeries 的口径**完全对齐**，否则「当日」和「全部」两张曲线
+   *   会给出两个不同的净资产。踩过的两个坑：
+   *   ① 净投入/分红要**按标的币种乘汇率** —— marketValueSeries 里是 `pos.netInvested * rate`，
+   *      漏乘的话持有港股/美股的组合会按外币原值（而不是人民币）去扣成本。
+   *   ② **没有分时的标的（场外基金 / 美股 / 长期停牌）必须把它的市值补回来** ——
+   *      它进不了逐分钟的 mv（alignMinute 会把它记进 missing），
+   *      若只扣它的净投入、不加它的市值，净资产会凭空少掉「市值」这一整块。
+   *      早就这么写的结果：一个含 5 万元场外基金的组合，当日净资产比真实值少了 4 万。
+   *
+   * @param minuteSymbols 真正参与当日分时曲线的标的（= 持仓标的 − alignMinute 的 missing）
+   */
+  function netWorthAdjust(state, accountId, minuteSymbols) {
+    var acc = accountId || ALL;
+    var hasMinute = {};
+    (minuteSymbols || []).forEach(function (s) { hasMinute[s] = true; });
+    var fx = (state.settings && state.settings.fx) || {};
+
+    var adj = 0;
+    holdings(state, acc).forEach(function (h) {
+      var rate = fxRate(XJ.market.currency(h.symbol), fx);
+      adj -= U.n0(h.netInvested) * rate;
+      /* 无分时的标的：它的市值全天是个常量，直接按现价补进来 */
+      if (!hasMinute[h.symbol]) adj += U.n0(h.marketValue);
+    });
+    (state.received || []).forEach(function (r) {
+      if (acc !== ALL && r.accountId !== acc) return;
+      adj += U.n0(r.amount) * fxRate(XJ.market.currency(r.symbol), fx);
+    });
+    return adj;
+  }
+
   /* ---- 当日分时缓存取用（纯函数） ----
      cache 结构：{ at:'YYYY-MM-DD', bySymbol:{ symbol:{ date:'YYYY-MM-DD', points:[{t,p}] } } }
      at 是这批数据的**交易日**（来自接口 date，不是本机今日）。
@@ -7061,6 +7874,8 @@ XJ.calc = (function () {
   return {
     ALL: ALL,
     alignMinute: alignMinute,
+    netWorthAdjust: netWorthAdjust,
+    cnyRateOf: cnyRateOf,
     minuteOf: minuteOf,
     minuteMapFor: minuteMapFor,
     perSharePretax: perSharePretax,
@@ -7071,6 +7886,13 @@ XJ.calc = (function () {
     plansOf: plansOf,
     trailingPerShare: trailingPerShare,
     annualBasePerShare: annualBasePerShare,
+    yieldFiscalSteps: yieldFiscalSteps,
+    dividendYieldSeries: dividendYieldSeries,
+    yieldYearAverages: yieldYearAverages,
+    yieldAverageSeries: yieldAverageSeries,
+    YIELD_AVG_FROM: YIELD_AVG_FROM,
+    YIELD_AVG_MIN_DAYS: YIELD_AVG_MIN_DAYS,
+    exDividendDates: exDividendDates,
     position: position,
     txOf: txOf,
     holdings: holdings,
@@ -7181,6 +8003,14 @@ XJ.store = (function () {
       status: '',
       planYear: 0,              // 个股档案选中项
       detailSymbol: null,
+      /* 个股详情页「股息率曲线」的时间轴选区（null = 默认最近十年）。
+         由 brush 松手时**静默写入**（不走 setUI）：拖动过程要实时重画主图，
+         而 setUI 会触发整页重建、滚动跳动，反过来把正在拖的手势打断。 */
+      yjBeg: null,
+      yjEnd: null,
+      /* 平均股息率线的口径：year = 该财年整段窗口的均值（阶梯线）| cum = 自切换日起逐日累积。
+         均线本身常亮、不可关闭，图例那一项点击是【换口径】而不是开关。 */
+      yieldAvgMode: 'year',
     },
 
     init: function (state) {
@@ -7657,7 +8487,8 @@ XJ.views.overview = (function () {
 
   function sortHoldings(rows, mode) {
     var list = rows.slice();
-    if (mode === 'marketValue') list.sort(function (a, b) { return (b.marketValue || 0) - (a.marketValue || 0); });
+    /* 排序一律用人民币口径：混币排序会让港股/美股的名次失真（港币数值天然更大） */
+    if (mode === 'marketValue') list.sort(function (a, b) { return (b.marketValueCny || 0) - (a.marketValueCny || 0); });
     else if (mode === 'yield') list.sort(function (a, b) { return (b.dividendYield || 0) - (a.dividendYield || 0); });
     else if (mode === 'costYield') list.sort(function (a, b) { return (b.costYield || 0) - (a.costYield || 0); });
     else if (mode === 'pl') list.sort(function (a, b) { return (b.unrealizedPct || -1e9) - (a.unrealizedPct || -1e9); });
@@ -7799,7 +8630,7 @@ XJ.views.overview = (function () {
        名字会被挤到只剩一两个字。口径在个股详情页的「持仓明细」里仍完整可见。
        这里只保留极少触发、但出现即重要的「已回本」。 */
     var tag = h.costRecovered ? '<span class="hc-tag pill div">已回本</span>' : '';
-    var mvDec = (h.marketValue !== null && Math.abs(h.marketValue) >= 10000) ? 0 : 2;
+    var mvDec = (h.marketValueCny !== null && Math.abs(h.marketValueCny) >= 10000) ? 0 : 2;
 
     /* 技术信号（中性文案，随现价每次重算；周线优先于日线） */
     var sigObj = signalOf(h);
@@ -7841,14 +8672,14 @@ XJ.views.overview = (function () {
       '</div>' +
       '</div>' +
       '<div class="hc-right">' +
-      '<div class="hc-div">' + U.moneySign(h.predictedDividend) + '</div>' +
+      '<div class="hc-div">' + U.moneySign(h.predictedDividendCny) + '</div>' +
       '<div class="hc-div-lbl">预测分红</div>' +
       '</div>' +
       '</div>' +
       intra +
       '<div class="hc-grid">' +
       '<div class="hc-cell"><div class="k">持仓</div><div class="v">' + U.thousands(h.qty) + '股</div></div>' +
-      '<div class="hc-cell"><div class="k">市值</div><div class="v">' + U.moneySign(h.marketValue, mvDec) + '</div></div>' +
+      '<div class="hc-cell"><div class="k">市值</div><div class="v">' + U.moneySign(h.marketValueCny, mvDec) + '</div></div>' +
       '<div class="hc-cell"><div class="k">成本</div><div class="v' + (h.avgCost < 0 ? ' c-div' : '') + '">' + U.money(h.avgCost, 4) + '</div></div>' +
       '<div class="hc-cell"><div class="k">股价息</div><div class="v c-div">' + (h.dividendYield === null ? '—' : U.pct(h.dividendYield)) + '</div></div>' +
       '</div>' +
@@ -8259,6 +9090,12 @@ XJ.views.networth = (function () {
       return html;
     }
 
+    /* 当日曲线取的是「最近一个交易日」那批分时（收盘后/周末照样能看）。
+       若它不是今天，标题里要写明日期 —— 否则「当日盘中 · 截至 14:59」会被读成实时行情，
+       进而觉得「涨跌和我持仓对不上」。 */
+    var minuteDay = isToday ? st.minuteDate() : null;
+    var dayHint = (minuteDay && minuteDay !== U.today()) ? '（' + U.mdShort(minuteDay) + '）' : '';
+
     /* ---- 大数字 ---- */
     var delta = null;
     if (isPct && !isToday) {
@@ -8296,7 +9133,7 @@ XJ.views.networth = (function () {
       var curP = lastT ? lastT.pct : null;
       html += '<div class="nw-amount' + (curP !== null && curP < 0 ? ' down' : '') + '">' +
         (curP === null ? '—' : U.signPct(curP)) + '</div>';
-      html += '<div class="tiny nw-sub">组合收益率（TWR，含股息）· 当日盘中' +
+      html += '<div class="tiny nw-sub">组合收益率（TWR，含股息）· 当日' + dayHint + '盘中' +
         (lastT ? ' · 截至 ' + U.esc(lastT.date) : '') + '</div>';
       var idxRows = chartSeries.filter(function (s) { return s.key !== 'ret'; }).map(function (s) {
         var last = s.points[s.points.length - 1];
@@ -8318,7 +9155,7 @@ XJ.views.networth = (function () {
       html += '<div class="nw-amount">' + (curV === null ? '—' : U.moneySign(curV)) + '</div>';
       html += '<div class="tiny nw-sub">' + U.esc(metricLabel) +
         (isToday && chartSeries.length
-          ? ' · 当日盘中 · 截至 ' + U.esc(chartSeries[0].points[chartSeries[0].points.length - 1].date)
+          ? ' · 当日' + dayHint + '盘中 · 截至 ' + U.esc(chartSeries[0].points[chartSeries[0].points.length - 1].date)
           : (series.length ? ' · 截至 ' + U.esc(series[series.length - 1].date) : '')) + '</div>';
       if (isToday && chartSeries.length) {
         /* 当日盘中变动：用曲线的首末点相减（不是日粒度的「较上日」） */
@@ -8363,7 +9200,7 @@ XJ.views.networth = (function () {
       if (isPct) {
         notes.push('涨跌幅以当日首个报价为基准；指数按同一基准归一化，可横向比较');
       } else if (metric === 'nw') {
-        notes.push('净资产 = 持仓总市值（分时） + 累计已收分红 − 累计净投入');
+        notes.push('净资产 = 分时持仓总市值 + 累计已收分红 − 累计净投入（没有分时的标的按其最新市值计入）');
       } else {
         notes.push('持仓市值按分时价格折算人民币；跨市场标的按设置里的汇率换算');
       }
@@ -8382,7 +9219,8 @@ XJ.views.networth = (function () {
       notes.push('有 ' + b.res.missing.length + ' 只标的没有历史行情（场外基金净值或长期停牌），未计入曲线');
     }
     if (isToday && intradayMissing && intradayMissing.length) {
-      notes.push('有 ' + intradayMissing.length + ' 只标的没有当日分时（场外基金 / 美股 / 长期停牌），未计入曲线');
+      notes.push('有 ' + intradayMissing.length + ' 只标的没有当日分时（场外基金 / 美股 / 长期停牌），' +
+        '不参与逐分钟曲线' + (metric === 'nw' ? '（净资产里按其最新市值作为常量计入）' : '，未计入曲线'));
     }
     html += '<div class="note-line" style="margin-top:8px">' + UI.icon('info', 13) +
       '<span>' + U.esc(notes.join('；')) + '</span></div>';
@@ -8413,17 +9251,6 @@ XJ.views.networth = (function () {
     var out = [];
     var acc = st.acc();
     var hs = XJ.calc.holdings(st.state, acc);
-    /* 净资产在当日 = 组合市值 + 累计已收分红 − 累计净投入。
-       后两项与盘口无关，先算成一个常量（与 calc.marketValueSeries 的口径一致：
-       分红按账户过滤，净投入取各持仓头寸的 netInvested）。 */
-    var nwAdj = 0;
-    if (metric === 'nw') {
-      hs.forEach(function (h) { nwAdj -= U.n0(h.netInvested); });
-      (st.state.received || []).forEach(function (r) {
-        if (acc !== XJ.calc.ALL && r.accountId !== acc) return;
-        nwAdj += U.n0(r.amount);
-      });
-    }
 
     /* ---- 组合分时：按时间戳对齐后累加 ----
        分时来自 state.minuteCache（落盘、收盘后仍在），只取「最近一个交易日」那批，
@@ -8432,6 +9259,17 @@ XJ.views.networth = (function () {
     var minMap = st.intradayFor(syms);
     var al = XJ.calc.alignMinute(hs, minMap, function (cur) { return fxRate(st, cur); });
     var mvPts = al.points;
+
+    /* 净资产在当日 = 逐分钟组合市值 + 常量项（分红 − 净投入 + 无分时标的的市值）。
+       常量项走 calc.netWorthAdjust —— 口径与「全部」区间的 marketValueSeries 完全一致，
+       别在这里内联手算（曾经内联的版本漏了汇率、又把无分时标的的成本扣了却没算它的市值，
+       一个含场外基金的组合能差出好几万）。 */
+    var nwAdj = 0;
+    if (metric === 'nw') {
+      var usedSyms = syms.filter(function (s) { return al.missing.indexOf(s) < 0; });
+      nwAdj = XJ.calc.netWorthAdjust(st.state, acc, usedSyms);
+    }
+
     if (mvPts.length >= 2) {
       var color = metric === 'nw' ? MK.METRIC_COLORS.nw
         : metric === 'ret' ? MK.METRIC_COLORS.ret : MK.METRIC_COLORS.mv;
@@ -9291,7 +10129,7 @@ XJ.views.analysis = (function () {
           ' · 现价 ' + (h.price === null ? '—' : U.money(h.price)) + '</div>' +
           '</div>' +
           '<div class="row-right">' +
-          '<div class="row-v ' + U.dirClass(h.unrealized) + '">' + U.signMoney(h.unrealized, 0) + '</div>' +
+          '<div class="row-v ' + U.dirClass(h.unrealizedCny) + '">' + U.signMoney(h.unrealizedCny, 0) + '</div>' +
           '<div class="row-v2 ' + U.dirClass(h.unrealizedPct) + '">' + U.signPct(h.unrealizedPct) + '</div>' +
           '</div>' +
           '<span class="chev">' + UI.icon('chevron', 16) + '</span>' +
@@ -9413,6 +10251,243 @@ XJ.views.symbol = (function () {
     return sig ? { text: sig.text, cls: sig.cls } : null;
   }
 
+  /* ---------------- 股息率曲线（财年口径） ----------------
+   * 口径见 calc.yieldFiscalSteps / calc.dividendYieldSeries 的注释。
+   *
+   * 时间轴：默认最近十年，**一律交易日（日线）粒度**。
+   * 腾讯单次 count 上限 2000 根（只够 8.2 年），所以取数分两个窗口拼接
+   * （见 fetcher.fetchYieldHistory），而不是退回周线 —— 退周线会让相邻点差好几天。
+   */
+  var YJ_COLOR = '#E8461F';        // 股息率（与分红金额同色）
+  var YJ_BENCH_COLOR = '#E9A93C';  // 余额宝七日年化
+  var YJ_MARK_COLOR = '#F08A24';   // 除权除息日散点
+  var YJ_AVG_COLOR = '#4A7BB0';    // 历史平均股息率（分财年，虚线）—— 中性冷色，不与涨红跌绿抢语义
+  var YJ_TEN_YEARS = 3653;         // ≈10 年
+
+  function yjBenchOn(st) {
+    return !!(st.state.settings && st.state.settings.showYieldBench === true);
+  }
+
+  function sliceByDate(list, beg, end) {
+    return (list || []).filter(function (p) { return p.date >= beg && p.date <= end; });
+  }
+
+  /**
+   * 生成股息率卡片。
+   * @param symbol 内部代码
+   * @param plans  该标的的全部 DividendPlan
+   * @param st     XJ.store
+   * @param h      持仓行（可能为 undefined，无持仓也照常出图）
+   */
+  function yieldCard(symbol, plans, st, h) {
+    var open = '<div class="card yj-card" style="margin-bottom:12px">';
+    var head = function (hint, extra) {
+      return '<div class="card-head" style="margin-bottom:10px">' +
+        '<h2>股息率</h2>' +
+        C.qmark('股息率 = 该财年派现总额 ÷ 当时总市值 × 100%。' +
+          '数学上等价于「每股派现 ÷ 当时股价」（总股本约掉）。' +
+          '分子的生效时点取该财年年报的预案公告日；含已公告的预案。') +
+        '<span class="hint">' + U.esc(hint) + '</span>' +
+        '<div class="spacer"></div>' + (extra || '') + '</div>';
+    };
+
+    /* ① 不支持的市场：美股无分红源、场外基金没有「财年派现」概念 */
+    if (!XJ.market.supportsYieldCurve(symbol)) {
+      var why = XJ.market.assetType(symbol) === 'of'
+        ? '场外基金的分红不定期、没有「财年派现」这个概念'
+        : XJ.market.kind(symbol) + '暂无公开可用的免费分红数据源';
+      return open + head('不适用') +
+        '<div class="tiny" style="line-height:1.7">因' + U.esc(why) +
+        '，无法按财年口径绘制股息率曲线。</div></div>';
+    }
+
+    var steps = XJ.calc.yieldFiscalSteps(plans || []);
+    var cache = (st.state.yieldHistory && st.state.yieldHistory[symbol]) || null;
+    var closes = (cache && cache.day) || [];
+
+    /* ② 没有可用的财年方案 */
+    if (!steps.length) {
+      return open + head('—') +
+        '<div class="tiny" style="line-height:1.7">还没有可用的年报分红数据。' +
+        '点下方「同步该标的数据」获取分红方案后即可绘制。</div></div>';
+    }
+
+    /* ③ 有方案但收盘价缓存还没到位 */
+    if (closes.length < 2) {
+      return open + head('—',
+        '<button class="ghost-btn" data-act="refreshOne" data-symbol="' + U.esc(symbol) + '">刷新</button>') +
+        '<div class="tiny" style="line-height:1.7">' +
+        (st.ui.busy ? '正在获取历史收盘价…' : '还没有历史收盘价。点右上「刷新」拉取后即可绘制曲线。') +
+        '</div></div>';
+    }
+
+    /* ---- 序列（只保留算得出股息率的点） ---- */
+    var all = XJ.calc.dividendYieldSeries(plans, closes);
+    if (all.length < 2) {
+      /* 价格有了，但没有任何一天落在财年生效日之后（例如刚上市的新股） */
+      return open + head('—') +
+        '<div class="tiny" style="line-height:1.7">历史收盘价与已公告的分红方案没有重叠区间，暂时画不出曲线。</div></div>';
+    }
+
+    /* ---- 平均股息率线（分财年） ----
+       口径由 ui.yieldAvgMode 决定，且**只吃 2022-01-01 起的样本**（calc 内部固定）。
+       刻意不用时间轴选区去切样本：均值是「该财年」的属性，不该随缩放而变。 */
+    var avgMode = st.ui.yieldAvgMode === 'cum' ? 'cum' : 'year';
+    var avgGroups = XJ.calc.yieldYearAverages(plans, closes);
+    var avgAll = XJ.calc.yieldAverageSeries(plans, closes, avgMode);
+
+    /* 默认最近十年：右端取序列最后一天，左端取「最后一天 − 10 年」但不早于序列起点 */
+    var endD = all[all.length - 1].date;
+    var begLimit = all[0].date;
+    var begD = U.addDays(endD, -YJ_TEN_YEARS);
+    if (!begD || begD < begLimit) begD = begLimit;
+    /* 若用户上次拖过时间轴，恢复他选的范围（静默写在 ui 里，见 onChange） */
+    if (st.ui.yjBeg && st.ui.yjEnd && st.ui.yjEnd >= begLimit && st.ui.yjBeg <= endD && st.ui.yjBeg < st.ui.yjEnd) {
+      begD = st.ui.yjBeg < begLimit ? begLimit : st.ui.yjBeg;
+      endD = st.ui.yjEnd > endD ? endD : st.ui.yjEnd;
+    }
+
+    var marks = XJ.calc.exDividendDates(plans || []);
+    var benchPts = (st.state.benchHistory && st.state.benchHistory.points) || [];
+    var showBench = yjBenchOn(st);
+
+    function buildMain(beg, end) {
+      var pts = sliceByDate(all, beg, end);
+      if (pts.length < 2) {
+        return { html: '<div class="tiny" style="padding:18px 0;text-align:center">该区间内数据不足。</div>' };
+      }
+      var seriesList = [{
+        key: 'yj', name: '股息率', color: YJ_COLOR,
+        points: pts.map(function (p) { return { date: p.date, pct: p.y }; }),
+      }];
+      /* 平均股息率线：与主曲线同一批日期（同一个 dividendYieldSeries 派生），按区间直接切片。
+         样本门槛只会落在首尾两个财年段 —— 中间的财年都有约 240 个交易日，不可能不足 120 天 ——
+         所以被跳过的那段永远在序列两端，折线不会跨过它连出一条假的斜线。 */
+      var av = sliceByDate(avgAll, beg, end);
+      if (av.length >= 2) {
+        seriesList.push({
+          key: 'avg', name: '历史平均股息率', color: YJ_AVG_COLOR, dash: '6 4', width: 1.5,
+          points: av.map(function (p) { return { date: p.date, pct: p.y }; }),
+        });
+      }
+      if (showBench && benchPts.length) {
+        var bp = sliceByDate(benchPts.map(function (p) { return { date: p[0], y: p[1] }; }), beg, end);
+        if (bp.length >= 2) {
+          seriesList.push({
+            key: 'bench', name: '余额宝七日年化', color: YJ_BENCH_COLOR,
+            points: bp.map(function (p) { return { date: p.date, pct: p.y }; }),
+          });
+        }
+      }
+      var svg = XJ.chart.renderCompare(seriesList, {
+        chartKey: 'yield', unit: 'yield', fmtY: U.pctAxis, xTicks: 4,
+        markers: marks, markerColor: YJ_MARK_COLOR,
+      });
+      return { html: svg || '<div class="tiny" style="padding:18px 0;text-align:center">该区间内数据不足。</div>' };
+    }
+
+    var built = buildMain(begD, endD);
+
+    /* brush 的概览序列：与主图同一批数据，这样拖动时左右边界一眼能对上 */
+    var overview = all;
+
+    function idxOfDate(list, d) {
+      var best = 0, bestGap = Infinity;
+      for (var i = 0; i < list.length; i++) {
+        var g = Math.abs(U.daysBetween(list[i].date, d) || 0);
+        if (g < bestGap) { bestGap = g; best = i; }
+      }
+      return best;
+    }
+
+    /* 拖动时间轴：**不碰 store**，直接重画主图容器的 innerHTML。
+       brush 是独立的第二个 SVG，所以重画主图不会销毁抓手、手势不会断。 */
+    function onChange(b, e, isFinal) {
+      if (!(b && e) || b >= e) return;
+      var box = document.querySelector('.yj-chart[data-yj-chart="1"]');
+      if (box) box.innerHTML = buildMain(b, e).html;
+      /* 每次变化都**静默**记进 ui（不走 setUI，否则整页重建 + 滚动跳动）。
+         拖动中记是为了「万一中途被后台重渲染打断」时能接着拖（chart.js 会据此把选区找回来）；
+         松手后记是为了让后续任何整页重渲染都能恢复用户选定的范围。 */
+      st.ui.yjBeg = b;
+      st.ui.yjEnd = e;
+      void isFinal;
+    }
+
+    var brushHtml = XJ.chart.brush(overview, {
+      chartKey: 'yield',
+      begIdx: idxOfDate(overview, begD),
+      endIdx: idxOfDate(overview, endD),
+      color: '#A8C4E8',
+      onChange: onChange,
+    });
+
+    /* ---- 图例 ----
+       余额宝那条是「开 / 关」；平均股息率那条**不是开关**（均线常亮、不可关闭），
+       点它是换口径 —— 所以刻意不给它 off 态，否则会被读成「这条线已关闭」。 */
+    var benchOn = showBench && benchPts.length >= 2;
+    var avgCum = avgMode === 'cum';
+    var legend = '<div class="yj-legend">' +
+      '<span class="on"><i class="ln" style="background:' + YJ_COLOR + '"></i>股息率</span>' +
+      '<button class="yj-leg-btn" data-act="switchYieldAvg"' +
+      ' title="点击切换口径：该财年整年均值 ⇄ 自切换日起逐日累积">' +
+      '<i class="ln dash" style="--lnc:' + YJ_AVG_COLOR + '"></i>历史平均股息率 · ' +
+      (avgCum ? '自切换日起累积' : '整年均值') + '</button>' +
+      '<button class="yj-leg-btn' + (benchOn ? ' on' : ' off') + '" data-act="toggleYieldBench">' +
+      '<i class="ln" style="background:' + (benchOn ? YJ_BENCH_COLOR : '#C7C7CC') + '"></i>余额宝七日年化收益率</button>' +
+      '<span class="on"><i class="sq" style="background:' + YJ_MARK_COLOR + '"></i>除权除息日</span>' +
+      '</div>';
+
+    /* ---- 当前读数 vs 均线：只给「高于 / 低于」，不给任何建议性措辞 ---- */
+    var viewPts = sliceByDate(all, begD, endD);
+    var lastPt = viewPts.length ? viewPts[viewPts.length - 1] : null;
+    var avgStat = '';
+    if (lastPt) {
+      var avgRef = null;
+      for (var ai = avgAll.length - 1; ai >= 0; ai--) {
+        if (avgAll[ai].date <= lastPt.date) { avgRef = avgAll[ai]; break; }
+      }
+      if (avgRef && avgRef.year === lastPt.year) {
+        avgStat = '当前 ' + lastPt.y.toFixed(2) + '% · FY' + lastPt.year +
+          (avgCum ? ' 累积均值 ' : ' 均值 ') + avgRef.y.toFixed(3) + '% → ' +
+          (lastPt.y >= avgRef.y ? '高于均值' : '低于均值');
+      } else {
+        var gg = null;
+        for (var yi = 0; yi < avgGroups.length; yi++) {
+          if (avgGroups[yi].year === lastPt.year) gg = avgGroups[yi];
+        }
+        if (gg) {
+          avgStat = 'FY' + gg.year + ' 生效 ' + gg.days + ' 个交易日，不足 ' +
+            XJ.calc.YIELD_AVG_MIN_DAYS + ' 天，暂不绘制该财年平均线。';
+        }
+      }
+    }
+    var avgStatHtml = avgStat ? '<div class="tiny yj-avg-stat">' + avgStat + '</div>' : '';
+
+    var benchTip = '';
+    if (benchOn) benchTip = '余额宝七日年化为周频（该数据本身极平滑，画日频只是徒增体积）。';
+    else if (showBench) benchTip = '正在获取余额宝七日年化数据…';
+
+    return open + head('最近十年 · 日线',
+      '<button class="ghost-btn" data-act="refreshOne" data-symbol="' + U.esc(symbol) + '">刷新</button>') +
+      legend + avgStatHtml +
+      '<div class="yj-chart" data-yj-chart="1">' + built.html + '</div>' +
+      (brushHtml ? '<div class="yj-brush">' + brushHtml + '</div>' : '') +
+      '<div class="tiny yj-note" style="line-height:1.7">' +
+      '注：股息率 = 该财年派现总额 ÷ 当时总市值（等价于每股派现 ÷ 当时股价）；' +
+      '分子含已公告的预案，以最终实施方案为准。' +
+      (benchTip ? '<br>' + U.esc(benchTip) : '') +
+      '<br>曲线上的橙色方块是除权除息日；拖动下方时间轴可缩放时间尺度。' +
+      '<br>平均股息率按财年分段计算：一个财年窗口内分子是常数，所以均线的高低只反映价格，' +
+      '与「当年分红比历史平均多还是少」无关。' +
+      (avgCum
+        ? '当前口径「自切换日起累积」：只用生效日到当天的样本，没有前视偏差；代价是财年开头样本少、均线会较陡。'
+        : '当前口径「整年均值」：用该财年整段窗口的样本，线条平稳；代价是年内用到了后面才发生的价格，回看历史信号有前视偏差。') +
+      '<br>分子换档（年报预案公告日）会让均线跳一格，切换日附近读数仅供参考；' +
+      '新财年样本不足 ' + XJ.calc.YIELD_AVG_MIN_DAYS + ' 个交易日时，该财年段不绘制。' +
+      '</div></div>';
+  }
+
   function render() {
     var st = XJ.store;
     var symbol = st.ui.subArg;
@@ -9453,7 +10528,7 @@ XJ.views.symbol = (function () {
         '<div style="flex:1;min-width:0">' +
         '<div class="muted" style="font-size:12px">预测年分红</div>' +
         '<div style="font-size:32px;font-weight:750;letter-spacing:-1.2px;color:var(--dividend);margin-top:3px">' +
-        U.moneySign(h.predictedDividend) + '</div>' +
+        U.moneySign(h.predictedDividendCny) + '</div>' +
         '<div class="tiny" style="margin-top:6px">每股 ' + U.money(h.annualPerShare, 4) + ' × ' + U.thousands(h.qty) + '股</div>' +
         '<div class="tiny" style="margin-top:2px">' + U.esc(C.planBasisLabel(h)) + '</div>' +
         '</div>' +
@@ -9481,7 +10556,7 @@ XJ.views.symbol = (function () {
 
     if (h) {
       html += '<div class="hc-grid">' +
-        '<div class="hc-cell"><div class="k">当前市值</div><div class="v">' + U.moneySign(h.marketValue) + '</div></div>' +
+        '<div class="hc-cell"><div class="k">当前市值</div><div class="v">' + U.moneySign(h.marketValueCny) + '</div></div>' +
         '<div class="hc-cell"><div class="k">收盘价 × 股数</div><div class="v">' +
         (price === null ? '—' : U.money(price) + ' × ' + U.thousands(h.qty)) + '</div></div>' +
         '</div>';
@@ -9489,6 +10564,10 @@ XJ.views.symbol = (function () {
       html += '<div class="tiny" style="margin-top:10px">当前账户下没有该标的的持仓。</div>';
     }
     html += '</div>';
+
+    /* ★ 股息率曲线（财年口径）—— 紧跟当前市值，位置最醒目。
+       无持仓也照常渲染：这是标的的基本面属性，与是否持有无关。 */
+    html += yieldCard(symbol, plans, st, h);
 
     if (h) {
       /* ③④⑤ 双息率 */
@@ -9518,16 +10597,18 @@ XJ.views.symbol = (function () {
         ' <span class="pill div">' + C.costMethodLabel(h.costMethod) + '</span>' +
         '<span class="pen">' + UI.icon('edit', 13, 1.9) + '</span></span></button>' +
         '<div class="kv"><span class="k">已实现盈亏' + C.qmark('由卖出价格与卖出时点的加权成本共同决定，所以不可直接编辑') + '</span>' +
-        '<span class="v ' + (h.costMethod === 'weighted' ? U.dirClass(h.realized) : 'muted') + '">' +
-        (h.costMethod === 'weighted' ? U.signMoney(h.realized) : '摊薄口径下不适用') + '</span></div>' +
+        '<span class="v ' + (h.costMethod === 'weighted' ? U.dirClass(h.realizedCny) : 'muted') + '">' +
+        (h.costMethod === 'weighted' ? U.signMoney(h.realizedCny) : '摊薄口径下不适用') + '</span></div>' +
         '<div class="kv"><span class="k">持股天数' + C.qmark('自首笔买入日起算') + '</span>' +
         '<span class="v">' + h.holdDays + ' 天' + (h.holdSince ? '（' + U.esc(h.holdSince) + ' 起）' : '') + '</span></div>' +
-        '<div class="kv"><span class="k">累计已获分红</span><span class="v c-div">' + U.moneySign(h.receivedTotal) + '</span></div>' +
+        '<div class="kv"><span class="k">累计已获分红</span><span class="v c-div">' + U.moneySign(h.receivedTotalCny) + '</span></div>' +
         (h.costMethod === 'dividendDiluted'
-          ? (h.receivedTotal > 0
+          ? (h.receivedTotalCny > 0
             ? '<div class="note-line" style="margin-top:8px">' + UI.icon('check', 13) +
-              '<span>已用累计分红 <b class="c-div">' + U.moneySign(h.receivedTotal, 0) +
-              '</b> 摊薄成本（每股摊薄 ' + U.money(h.receivedTotal / (h.qty || 1), 4) +
+              /* 这一句讲的是「每股成本被摊薄了多少」，而每股成本是**原币**（港股就是港元），
+                 所以金额也用原币并标出币种符号，否则 ¥ 总额配 HK$ 每股会自相矛盾。 */
+              '<span>已用累计分红 <b class="c-div">' + U.esc(h.curSymbol) + U.money(h.receivedTotal, 0) +
+              '</b> 摊薄成本（每股摊薄 ' + U.esc(h.curSymbol) + U.money(h.receivedTotal / (h.qty || 1), 4) +
               '）—— 分红到账后成本自动下降，无需手工改。</span></div>'
             : '<div class="note-line" style="margin-top:8px">' + UI.icon('info', 13) +
               '<span>当前口径是「分红摊薄」，但该标的还没有已到账的分红记录，所以成本尚未下降；' +
@@ -9541,8 +10622,10 @@ XJ.views.symbol = (function () {
      * 另外把该标的的**分红到账**以只读行并入，这样「分红摊薄成本」是怎么降下来的能直接看到
      * （同花顺的交易流水也是这么呈现的）。分红只是展示，真正的计算仍走 received 记录，
      * 因此不会与分红记录重复计数。 */
+    /* 分红记录/流水里的「金额」一列都带 ¥，所以先换成人民币，避免港币分红显示成 ¥ 原值 */
+    var yRate = XJ.calc.cnyRateOf(st.state, symbol);
     var divRows = recs.map(function (r) {
-      return { kind: 'div', date: r.exDividendDate, amount: U.n0(r.amount), perShare: U.n0(r.perShareAmount),
+      return { kind: 'div', date: r.exDividendDate, amount: U.n0(r.amount) * yRate, perShare: U.n0(r.perShareAmount),
                qty: U.n0(r.qtyAtRecord), source: r.source };
     });
     var txFolded = st.ui.foldTx !== false;      // 默认收起
@@ -9607,12 +10690,12 @@ XJ.views.symbol = (function () {
         '<div class="bar' + (h.recoveryPct >= 100 ? ' green' : '') + '"><i style="width:' +
         U.clamp(h.recoveryPct, 0, 100).toFixed(1) + '%"></i></div>' +
         '<div class="recover-grid">' +
-        '<div class="rc"><div class="k">净投入</div><div class="v">' + U.moneySign(h.netInvested, 0) + '</div></div>' +
-        '<div class="rc accent"><div class="k">已收回分红</div><div class="v">' + U.moneySign(h.receivedTotal, 0) + '</div></div>' +
-        '<div class="rc"><div class="k">剩余待回收</div><div class="v">' + U.moneySign(h.remaining, 0) + '</div></div>' +
+        '<div class="rc"><div class="k">净投入</div><div class="v">' + U.moneySign(h.netInvestedCny, 0) + '</div></div>' +
+        '<div class="rc accent"><div class="k">已收回分红</div><div class="v">' + U.moneySign(h.receivedTotalCny, 0) + '</div></div>' +
+        '<div class="rc"><div class="k">剩余待回收</div><div class="v">' + U.moneySign(h.remainingCny, 0) + '</div></div>' +
         '</div>' +
         '<div class="kv" style="margin-top:6px"><span class="k">预计回本</span><span class="v">' +
-        (h.remaining <= 0 ? '已回本' : (h.expectedYears === null ? '—' : h.expectedYears.toFixed(1) + ' 年')) +
+        (h.remainingCny <= 0 ? '已回本' : (h.expectedYears === null ? '—' : h.expectedYears.toFixed(1) + ' 年')) +
         '</span></div>' +
         '<div class="note-line" style="margin-top:8px">' + UI.icon('info', 13) +
         '<span>净投入 = 累计买入 − 累计卖出（卖出回款也算收回本金）；剩余待回收 ÷ 当前年分红 = 预计回本年。</span></div>' +
@@ -9656,7 +10739,7 @@ XJ.views.symbol = (function () {
     html += '<div class="card flush" style="margin-bottom:12px">';
     html += '<div style="padding:14px 16px 8px"><div class="card-head" style="margin:0"><h2>分红记录</h2>' +
       '<div class="spacer"></div><span class="hint">累计 ' +
-      U.moneySign(U.sum(recs, function (r) { return r.amount; })) + '</span>' +
+      U.moneySign(U.sum(recs, function (r) { return r.amount; }) * yRate) + '</span>' +
       '<button class="ghost-btn" data-act="openReceiveEditor" data-symbol="' + U.esc(symbol) + '">+ 添加</button></div></div>';
     if (!recs.length) {
       html += '<div style="padding:0 16px 16px" class="tiny">还没有到账记录。已实施且派息日已过的方案会自动登记；历史数据可手动补录。</div>';
@@ -9668,7 +10751,7 @@ XJ.views.symbol = (function () {
           (r.source === 'AUTO' ? '自动' : '手动') + '</div></td>' +
           '<td>' + (r.perShareAmount > 0 ? U.money(r.perShareAmount, 4) : '<span class="muted">—</span>') + '</td>' +
           '<td>' + (r.qtyAtRecord > 0 ? U.thousands(r.qtyAtRecord) : '<span class="muted">—</span>') + '</td>' +
-          '<td class="c-div">' + U.moneySign(r.amount) +
+          '<td class="c-div">' + U.moneySign(r.amount * yRate) +
           (r.source === 'MANUAL'
             ? '<div><button class="tiny" style="color:var(--up);margin-top:2px" data-act="deleteReceive" data-id="' +
             U.esc(r.recId) + '">删除</button></div>'
@@ -9910,8 +10993,11 @@ XJ.views.symbol = (function () {
         resolveLogosNow(false);
         ensureHistory(false);
         ensureKline(false);
+        ensureYieldHistory(false);
         ensureIndexData(false);
         refreshIndexMinutes();
+        /* 余额宝基准只在用户打开了那条曲线时才拉 */
+        if (S.state.settings && S.state.settings.showYieldBench) ensureBench(false);
       });
     }).catch(function (e) {
       console.error('[sync]', e);
@@ -10151,6 +11237,84 @@ XJ.views.symbol = (function () {
   }
 
   /**
+   * 股息率曲线的收盘价缓存（每只标的每天刷新一次，落在 state.yieldHistory）。
+   *
+   * 与 ensureHistory 的区别：那套只取 400 根日线（≈1.5 年）给资产走势用；
+   * 这套要「最近十年」，而腾讯日线硬上限 2000 根只够 8.2 年，
+   * 所以额外取一套周线（640 根 ≈ 12.5 年），由视图层按可见跨度自行切换粒度。
+   *
+   * 失败的记账方式与 ensureHistory 一致（按标的、按天），避免每轮同步反复重试同一只。
+   */
+  var yieldBusy = false;
+  function ensureYieldHistory(force) {
+    if (yieldBusy || !S.state) return Promise.resolve(0);
+    var syms = S.activeSymbols().filter(function (s) { return XJ.market.supportsYieldCurve(s); });
+    if (!syms.length) return Promise.resolve(0);
+    var today = U.today();
+    if (!S.ui.yieldTriedAt) S.ui.yieldTriedAt = {};
+    if (!S.state.yieldHistory) S.state.yieldHistory = {};
+    var need = syms.filter(function (sym) {
+      var rec = S.state.yieldHistory[sym];
+      if (force) return true;
+      /* v=2 起改成「最近十年日线」（分两个窗口取），旧的双粒度缓存一律重取 */
+      if (!rec || rec.v !== 2 || !rec.day || rec.day.length < 2) return S.ui.yieldTriedAt[sym] !== today;
+      return rec.at !== today;
+    });
+    if (!need.length) return Promise.resolve(0);
+
+    yieldBusy = true;
+    need.forEach(function (sym) { S.ui.yieldTriedAt[sym] = today; });
+
+    var codes = {};
+    need.forEach(function (sym) {
+      var rec = S.state.symbols[sym];
+      if (rec && rec.quoteCode) codes[sym] = rec.quoteCode;
+    });
+
+    return XJ.fetcher.fetchYieldHistory(need, { codes: codes }).then(function (map) {
+      var got = 0;
+      Object.keys(map).forEach(function (sym) {
+        var pack = map[sym];
+        if (!pack || !pack.day || pack.day.length < 2) return;
+        S.state.yieldHistory[sym] = { v: 2, at: today, day: pack.day };
+        got++;
+      });
+      yieldBusy = false;
+      S.commitNow(null);
+      return got;
+    }).catch(function () {
+      yieldBusy = false;
+      S.notify();
+      return 0;
+    });
+  }
+
+  /**
+   * 余额宝七日年化（股息率曲线的对比基准）。
+   * 只在用户打开图例里那条曲线时才拉 —— 默认关闭，不必白白多一次请求。
+   */
+  var benchBusy = false;
+  function ensureBench(force) {
+    if (benchBusy || !S.state) return Promise.resolve(0);
+    if (!force && S.state.benchHistory && S.state.benchHistory.points &&
+      S.state.benchHistory.points.length >= 2 && S.state.benchHistory.at === U.today()) {
+      return Promise.resolve(0);
+    }
+    benchBusy = true;
+    return XJ.fetcher.fetchBenchSevenDay().then(function (pts) {
+      benchBusy = false;
+      if (!pts || pts.length < 2) { S.notify(); return 0; }
+      S.state.benchHistory = { at: U.today(), points: pts };
+      S.commitNow(null);
+      return pts.length;
+    }).catch(function () {
+      benchBusy = false;
+      S.notify();
+      return 0;
+    });
+  }
+
+  /**
    * 技术信号的 OHLC K 线缓存（每只标的每天刷新一次，落在 state.klineCache）。
    *
    * 与 ensureHistory 的分工：
@@ -10260,6 +11424,21 @@ XJ.views.symbol = (function () {
   function refreshOne(symbol) {
     var src = XJ.market.dividendSource(symbol);
     UI.toast('正在同步 ' + S.symbolName(symbol) + '…');
+    /* 股息率曲线要的那份长历史收盘价，也一并强制重取（它是独立缓存，不在 fetchQuotes 里） */
+    if (XJ.market.supportsYieldCurve(symbol)) {
+      S.ui.yieldTriedAt = S.ui.yieldTriedAt || {};
+      delete S.ui.yieldTriedAt[symbol];
+      var ycodes = {};
+      var yrec = S.state.symbols[symbol];
+      if (yrec && yrec.quoteCode) ycodes[symbol] = yrec.quoteCode;
+      XJ.fetcher.fetchYieldHistory([symbol], { codes: ycodes }).then(function (map) {
+        var pack = map && map[symbol];
+        if (!pack || !pack.day || pack.day.length < 2) return;
+        S.state.yieldHistory[symbol] = { v: 2, at: U.today(), day: pack.day };
+        S.ui.yjBeg = null; S.ui.yjEnd = null;      // 重取后回到默认「最近十年」
+        S.commitNow(null);
+      }).catch(function () { /* 曲线取数失败不影响下面的行情与分红同步 */ });
+    }
     XJ.fetcher.fetchQuotes([symbol]).then(function (quotes) {
       S.mergeQuotes(quotes);
       return pullPlansFor(symbol);
@@ -10492,7 +11671,7 @@ XJ.views.symbol = (function () {
         '· 交易记录 <b>' + txs.length + '</b> 笔<br>' +
         '· 分红记录 <b>' + recs.length + '</b> 笔' +
         (h ? '<br><br>当前持有 <b>' + U.thousands(h.qty) + '</b> 股' +
-          (h.marketValue !== null ? '，市值 ' + U.moneySign(h.marketValue) : '') : '') +
+          (h.marketValueCny !== null ? '，市值 ' + U.moneySign(h.marketValueCny) : '') : '') +
         '<br><br><span style="color:var(--up)">删除后不可撤销</span>，建议先在「我的 · 数据管理」导出一份 JSON 备份。',
       confirmText: '删除',
       danger: true,
@@ -10723,6 +11902,19 @@ XJ.views.symbol = (function () {
 
   UI.on('refreshOne', function (node) {
     refreshOne(node.getAttribute('data-symbol'));
+  });
+
+  /* 股息率曲线的「余额宝七日年化」基准线开关（默认关闭，状态持久化在 settings 里） */
+  UI.on('toggleYieldBench', function () {
+    var on = !(S.state.settings && S.state.settings.showYieldBench === true);
+    S.commit(function (s) { s.settings.showYieldBench = on; });
+    if (on) ensureBench(false);
+  });
+
+  /* 平均股息率线的口径切换：整年均值 ⇄ 自切换日起累积。
+     注意这不是「开/关」—— 均线常亮不可关闭，点图例只是换一条口径。 */
+  UI.on('switchYieldAvg', function () {
+    S.setUI({ yieldAvgMode: S.ui.yieldAvgMode === 'cum' ? 'year' : 'cum' });
   });
 
   /* ---- 悬浮双入口 ---- */
@@ -11808,19 +13000,24 @@ XJ.views.symbol = (function () {
     var h = XJ.calc.holdings(st.state, acc).filter(function (x) { return x.symbol === symbol; })[0];
     if (!h) return UI.toast('当前账户下没有该标的的持仓');
 
+    /* 这一屏改的是【每股成本 / 成交价】，单位是标的的原币（港股就是港元）。
+       金额一律带币种符号显示，不能写死 ¥ —— 否则港股会显示成「¥300 的每股成本」。 */
+    var cs = U.esc(h.curSymbol);
+    var unit = h.currency === 'CNY' ? '元' : h.currency;
+
     var html =
       '<div class="field"><label>当前持仓</label>' +
       '<div class="kv" style="padding:0"><span class="k">' + U.thousands(h.qty) + ' 股</span>' +
-      '<span class="v">' + U.money(h.avgCost, 4) + ' / 股</span></div></div>' +
+      '<span class="v">' + cs + U.money(h.avgCost, 4) + ' / 股</span></div></div>' +
       '<div class="field"><label>修改为（股）</label>' +
       '<input type="text" inputmode="numeric" data-k="qty" data-input="qtyPreview" value="' + U.esc(U.n0(h.qty)) + '"></div>' +
       '<div class="field"><label>调整价格</label>' +
       '<select data-k="mode" data-input="qtyPreview">' +
-      '<option value="avg" selected>以当前成本价 ¥' + U.money(h.avgCost, 4) + ' 补记（每股成本不变）</option>' +
-      '<option value="zero">以 0 元补记（送股 / 转增，总成本不变）</option>' +
+      '<option value="avg" selected>以当前成本价 ' + cs + U.money(h.avgCost, 4) + ' 补记（每股成本不变）</option>' +
+      '<option value="zero">以 0 ' + U.esc(unit) + '补记（送股 / 转增，总成本不变）</option>' +
       '<option value="custom">手动输入价格</option>' +
       '</select></div>' +
-      '<div class="field"><label>手动价格（元）</label>' +
+      '<div class="field"><label>手动价格（' + U.esc(unit) + '）</label>' +
       '<input type="text" inputmode="decimal" data-k="price" data-input="qtyPreview" value="' + U.esc(U.money(h.avgCost, 4)) + '"></div>' +
       '<div id="xj-qty-preview" class="note-line" style="margin:4px 0 12px">' +
       UI.icon('info', 13) + '<span>输入目标数量后查看将要补记的交易</span></div>' +
@@ -11878,6 +13075,7 @@ XJ.views.symbol = (function () {
       /* 预览「调整后」的每股成本：直接把将要补记的交易丢给同一个 position() 引擎算，
          保证预览与保存后的结果完全一致（不在视图里另写一套公式）。 */
       var h = XJ.calc.holdings(S.state, S.acc()).filter(function (x) { return x.symbol === symbol; })[0];
+      var cs = U.esc(h ? h.curSymbol : '¥');       // 金额是原币口径，币种符号跟着标的走
       var previewTx = {
         txId: '__preview__', accountId: S.acc() === XJ.calc.ALL ? S.state.settings.defaultAccountId : S.acc(),
         symbol: symbol, action: p.action, date: U.today(),
@@ -11886,8 +13084,8 @@ XJ.views.symbol = (function () {
       var before = XJ.calc.txOf(S.state, S.acc(), symbol).filter(function (t) { return t.txId !== '__preview__'; });
       var after = XJ.calc.position(before.concat([previewTx]), null, h.costMethod, h.receivedTotal);
       text = '将补记：' + (p.action === 'BUY' ? '买入' : '卖出') + ' ' + U.thousands(p.qty) + ' 股 @ ' +
-        U.money(p.price, 4) + '（金额 ' + U.moneySign(p.amount) + '，日期 ' + U.today() + '）' +
-        '<br>调整后：' + U.thousands(after.qty) + ' 股 · 每股成本 ' + U.money(after.avgCost, 4);
+        cs + U.money(p.price, 4) + '（金额 ' + cs + U.money(p.amount, 2) + '，日期 ' + U.today() + '）' +
+        '<br>调整后：' + U.thousands(after.qty) + ' 股 · 每股成本 ' + cs + U.money(after.avgCost, 4);
     }
     box.innerHTML = UI.icon('info', 13) + '<span>' + text + '</span>';
   }
@@ -11928,11 +13126,14 @@ XJ.views.symbol = (function () {
     var h = XJ.calc.holdings(S.state, S.acc()).filter(function (x) { return x.symbol === symbol; })[0];
     if (!h) return UI.toast('当前账户下没有该标的的持仓');
 
+    /* 同 showQtyEditor：这一屏的金额都是【原币】的每股成本/成本合计，币种符号要跟着标的走 */
+    var cs = U.esc(h.curSymbol);
+    var unit = h.currency === 'CNY' ? '元' : h.currency;
     var html =
       '<div class="field"><label>当前持仓与成本</label>' +
       '<div class="kv" style="padding:0"><span class="k">' + U.thousands(h.qty) + ' 股</span>' +
-      '<span class="v">均价 ' + U.money(h.avgCost, 4) + ' · 合计 ' + U.moneySign(h.costValue) + '</span></div></div>' +
-      '<div class="field"><label>修改为（每股成本，元）</label>' +
+      '<span class="v">均价 ' + cs + U.money(h.avgCost, 4) + ' · 合计 ' + cs + U.money(h.costValue, 2) + '</span></div></div>' +
+      '<div class="field"><label>修改为（每股成本，' + U.esc(unit) + '）</label>' +
       '<input type="text" inputmode="decimal" data-k="avg" data-input="costPreview" value="' + U.esc(U.money(h.avgCost, 4)) + '"></div>' +
       '<div id="xj-cost-preview" class="note-line" style="margin:4px 0 12px">' +
       UI.icon('info', 13) + '<span>输入目标成本后查看将要补记的调整金额</span></div>' +
@@ -11970,10 +13171,13 @@ XJ.views.symbol = (function () {
     var box = sheet.querySelector('#xj-cost-preview');
     if (!box) return;
     var p = costAdjustPlan(sheet, symbol);
+    /* 成本调整的金额是【原币】口径（改的就是每股成本，港股即港元），所以用币种符号而非 ¥ */
+    var h0 = XJ.calc.holdings(S.state, S.acc()).filter(function (x) { return x.symbol === symbol; })[0];
+    var cs = U.esc(h0 ? h0.curSymbol : '¥');
     var text = !p ? '找不到该持仓'
       : p.err ? p.err
-        : '将补记一笔成本调整：' + U.signMoney(p.amount) +
-          '（成本合计 ' + U.moneySign(p.basis) + ' → ' + U.moneySign(p.basis + p.amount) + '）';
+        : '将补记一笔成本调整：' + (p.amount > 0 ? '+' : '−') + cs + U.money(Math.abs(p.amount), 2) +
+          '（成本合计 ' + cs + U.money(p.basis, 2) + ' → ' + cs + U.money(p.basis + p.amount, 2) + '）';
     box.innerHTML = UI.icon('info', 13) + '<span>' + text + '</span>';
   }
 
