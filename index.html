@@ -460,6 +460,31 @@ table.tbl tbody tr:active{ background:var(--card-2); }
 .hero-dark.collapsed .hd-collapsed-hint{ display:block; }
 .hd-collapsed-hint{ display:none; font-size:11.5px; color:var(--hero-dim); margin-top:8px; position:relative; z-index:1; }
 
+/* ---- 深色卡内的「测算带」：每年投入 × 股息率 → N 年后月均分红 ----
+   月均是派生量，只能通过点开参数或反解来改变；数字做成「点开才能改」的胶囊。 */
+.hero-dark.collapsed .hd-forecast{ display:none; }
+.hd-forecast{ margin-top:12px; padding-top:11px; border-top:.5px solid rgba(242,242,247,.14); position:relative; z-index:1; }
+.hf-line{ font-size:12.5px; line-height:2; color:var(--hero-dim); }
+.hf-sub{ font-size:11.5px; color:var(--hero-dim); margin-top:2px; }
+.hf-dot{ margin:0 6px; opacity:.6; }
+.hf-num{
+  display:inline-block; padding:0 5px; margin:0 1px; border-radius:6px;
+  background:rgba(255,255,255,.10); color:#fff;
+  font-size:12.5px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.6;
+  border-bottom:1px dashed rgba(242,242,247,.5);
+}
+.hf-num:active{ background:rgba(255,255,255,.24); }
+.hf-num.hf-out{ color:var(--dividend-mid); }
+.hf-foot{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:9px; font-size:11px; }
+.hf-solve{ display:inline-flex; align-items:center; gap:5px; color:var(--hero-dim); }
+.hf-chip{
+  padding:1px 8px; border-radius:999px; font-size:10.5px;
+  background:rgba(255,255,255,.10); color:var(--hero-dim);
+}
+.hf-chip.active{ background:rgba(242,242,247,.92); color:#2C2C2E; font-weight:650; }
+.hf-link{ font-size:11px; color:var(--hero-dim); text-decoration:underline; }
+.hf-link:active{ opacity:.6; }
+
 /* 指标旁的「?」解释 */
 .qmark{
   display:inline-flex; align-items:center; justify-content:center;
@@ -1008,6 +1033,11 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   .hd-metric{ padding:7px 4px 5px; }
   .hd-metric .v{ font-size:14px; }
   .hd-metric .k{ font-size:10px; }
+  .hd-forecast{ margin-top:10px; padding-top:9px; }
+  .hf-line{ font-size:11.5px; line-height:2.05; }
+  .hf-num{ font-size:11.5px; padding:0 4px; }
+  .hf-sub{ font-size:11px; }
+  .hf-foot{ gap:8px; margin-top:7px; }
   .hold-card{ margin-bottom:8px; }
   .hc-main{ padding:12px 12px 10px; }
   .hc-del{ top:8px; right:8px; width:28px; height:28px; }
@@ -2049,6 +2079,10 @@ XJ.model = (function () {
         onboarded: false,
         heroMetrics: HERO_METRICS.map(function (m) { return m.key; }),
         heroCollapsed: false,
+        /* 深色卡「测算带」参数（每年投入 / 股息率 / 年数 / 再投比例 / 反解目标）。
+           首次启动由 ensureBootstrapped 从 projection 派生起点，之后与「展望未来」完全独立。
+           yieldPct = null 表示「跟随当前组合市值息率」，用户一旦手改就固定下来。 */
+        heroForecast: null,
         defaultDividendBasis: { type: 'years', value: 1 },
         fx: null,                        // { HKD, USD, updatedAt }
         ocr: {                           // 截图识别（智谱 GLM-4V）
@@ -2219,6 +2253,19 @@ XJ.model = (function () {
     }
     if (!Array.isArray(state.settings.heroMetrics) || !state.settings.heroMetrics.length) {
       state.settings.heroMetrics = HERO_METRICS.map(function (m) { return m.key; });
+    }
+    /* 深色卡「测算带」：首次启动借「展望未来」的定投与年数当起点，之后两者完全独立。
+       yieldPct 留 null = 跟随当前组合市值息率（用户手改后落成数字，不再浮动）。 */
+    if (!state.settings.heroForecast || typeof state.settings.heroForecast !== 'object') {
+      var pf = state.projection || {};
+      var mi = U.n0(pf.monthlyInvest);
+      state.settings.heroForecast = {
+        annualInvest: mi > 0 ? mi * 12 : 60000,
+        yieldPct: null,
+        years: U.clamp(Math.round(U.n0(pf.years) || 10), 1, 50),
+        reinvestPct: 100,               // 默认 100% 再投（与 FORECAST.reinvestDefaultPct 一致）
+        solveFor: 'years',
+      };
     }
     if (!state.settings.defaultDividendBasis) {
       state.settings.defaultDividendBasis = { type: 'years', value: 1 };
@@ -6553,6 +6600,186 @@ XJ.calc = (function () {
     };
   }
 
+  /* ---------------- 首页测算带：每年投入 × 股息率 → N 年后月均分红 ----------------
+   * 与「展望未来」是**两套不同口径**，故意不共用（各自独立）：
+   *   · 展望未来：期初息率 = 组合年分红 ÷ 组合市值，作用于**全部资产**且逐年恒定；
+   *   · 本测算：股息率只作用于**新投入的钱**，现有持仓的预测年度分红 P0 保持不变。
+   *
+   * 设 X = 每年投入（元）、y = 股息率、r = 再投比例（0–1）、P0 = 现有持仓预测年度分红（元）：
+   *   A ← 0                         「新钱池」资产（本金 + 历年再投），按 y 生息
+   *   for k = 1..N:
+   *     A += X                      当年投入（当年即产生整年分红，与 projection 的次序一致）
+   *     divNew = A × y
+   *     D = P0 + divNew             当年总分红
+   *     A += D × r                  年末再投（买同样 y% 的股票，从次年起才计息）
+   *   月均 = D ÷ 12
+   *
+   * 闭式（用于反解与交叉校验）：
+   *   令 a = 1 + r·y，B_k =「当年投入后、**年末再投前**」的新钱池，A_k = 年末再投后的池子
+   *     B_1 = X,  B_{k+1} = a·B_k + (r·P0 + X),  A_k = a·B_k + r·P0
+   *     B_N = (a == 1) ? X + (N−1)(r·P0 + X)
+   *                    : X·a^(N−1) + (r·P0 + X)·(a^(N−1) − 1)/(a − 1)
+   *     D_N = P0 + y·B_N
+   *   ⚠️ 当年分红必须用 **B_N（再投前）**：年末再投的那笔从次年起才计息。
+   *      早先把 A_N 当成 B_N 用，导致 r>0 时闭式与递推差一截（自检抓到的真实缺陷）。
+   *   r = 0 时 a = 1、B_N = N·X → D_N = P0 + N·X·y ——「不再投」是这套公式的特例，
+   *   因此**不存在第二套算法**（不要另写一个"线性版本"）。
+   */
+  var FORECAST = {
+    investMaxYuan: 100000000,   // 每年投入上限：10000 万
+    investMaxWan: 10000,
+    yieldMaxPct: 30,            // 股息率上限 30%
+    yearsMin: 1,
+    yearsMax: 50,
+    reinvestDefaultPct: 100,
+  };
+
+  /** 输入规整：所有测算入口先过这里，保证 X / y / N / r 只在合法范围内 */
+  function normalizeForecast(cfg) {
+    cfg = cfg || {};
+    var invest = U.n0(cfg.annualInvest);
+    /* 年数：缺失/null 视为默认 10；显式写 0 则按最小值 1 处理（不能把 0 当成"没填"） */
+    var yearsRaw = U.num(cfg.years);
+    var years = (yearsRaw === null) ? 10 : Math.round(yearsRaw);
+    return {
+      annualInvest: invest > 0 ? Math.min(invest, FORECAST.investMaxYuan) : 0,
+      yieldPct: U.clamp(U.n0(cfg.yieldPct), 0, FORECAST.yieldMaxPct),
+      years: U.clamp(years, FORECAST.yearsMin, FORECAST.yearsMax),
+      reinvestPct: U.clamp(U.n0(cfg.reinvestPct), 0, 100),
+    };
+  }
+
+  /** 逐年递推：返回逐年明细与期末结果（月均是派生量，不单独存储） */
+  function forecastRows(cfg, baseDividend) {
+    var c = normalizeForecast(cfg);
+    var X = c.annualInvest;
+    var y = c.yieldPct / 100;
+    var r = c.reinvestPct / 100;
+    var P0 = Math.max(0, U.n0(baseDividend));
+
+    var A = 0;
+    var rows = [];
+    var thisYear = new Date().getFullYear();
+    for (var k = 1; k <= c.years; k++) {
+      A += X;
+      var divNew = A * y;
+      var D = P0 + divNew;
+      A += D * r;
+      rows.push({
+        year: k,
+        calendarYear: thisYear + k,
+        invest: X,
+        dividend: D,
+        monthly: D / 12,
+        fromExisting: P0,
+        fromNew: divNew,
+        reinvest: D * r,
+        assetsNew: A,
+      });
+    }
+    var last = rows[rows.length - 1] || null;
+    return {
+      cfg: c,
+      baseDividend: P0,
+      rows: rows,
+      endDividend: last ? last.dividend : P0,
+      monthly: last ? last.monthly : P0 / 12,
+      fromExisting: P0,
+      fromNew: last ? last.fromNew : 0,
+      assetsNew: last ? last.assetsNew : 0,
+      totalContribution: X * c.years,
+    };
+  }
+
+  /**
+   * 闭式：第 N 年「当年投入后、年末再投前」的新钱池 B_N。
+   * 其余所有闭式（年分红、两个反解）都由它派生，避免各处各写一遍公式。
+   */
+  function forecastPoolAt(cfg, baseDividend, years) {
+    var c = normalizeForecast(cfg);
+    var X = c.annualInvest, y = c.yieldPct / 100, r = c.reinvestPct / 100;
+    var P0 = Math.max(0, U.n0(baseDividend));
+    var N = Math.max(0, Math.round(U.n0(years)));
+    if (N <= 0) return 0;
+    var a = 1 + r * y;
+    var c2 = X + r * P0;
+    if (Math.abs(a - 1) < 1e-12) return X + (N - 1) * c2;
+    var p = Math.pow(a, N - 1);
+    return X * p + c2 * (p - 1) / (a - 1);
+  }
+
+  /** 闭式：第 N 年的年分红（与 forecastRows 交叉校验；反解也用它） */
+  function forecastDividendAt(cfg, baseDividend, years) {
+    var c = normalizeForecast(cfg);
+    var P0 = Math.max(0, U.n0(baseDividend));
+    return P0 + (c.yieldPct / 100) * forecastPoolAt(cfg, P0, years);
+  }
+
+  /**
+   * 反解年数：目标月均 T → 最少需要多少年。
+   * ok=false 时 reason ∈ 'no-growth' | 'beyond-limit'，调用方**不得改写任何参数**（避免写入假值）。
+   */
+  function forecastSolveYears(cfg, baseDividend, targetMonthly) {
+    var c = normalizeForecast(cfg);
+    var X = c.annualInvest, y = c.yieldPct / 100, r = c.reinvestPct / 100;
+    var P0 = Math.max(0, U.n0(baseDividend));
+    var need = U.n0(targetMonthly) * 12;
+    if (need <= P0) return { ok: true, years: 0, exact: 0, reached: true };
+    if (y <= 0) return { ok: false, reason: 'no-growth' };
+    var B = (need - P0) / y;                     // 目标所需的 B_N
+    var a = 1 + r * y;
+    var c2 = X + r * P0;
+    var b = X * a + r * P0;
+    var n;
+    if (Math.abs(a - 1) < 1e-12) {
+      if (c2 <= 0) return { ok: false, reason: 'no-growth' };   // X=0 且 r=0：新钱池永远是 0
+      n = 1 + (B - X) / c2;
+    } else {
+      if (b <= 0) return { ok: false, reason: 'no-growth' };
+      var p = (B * (a - 1) + c2) / b;            // = a^(N−1)
+      if (!(p > 0)) return { ok: false, reason: 'no-growth' };
+      n = 1 + Math.log(p) / Math.log(a);
+    }
+    if (!isFinite(n)) return { ok: false, reason: 'no-growth' };
+    if (n > FORECAST.yearsMax) return { ok: false, reason: 'beyond-limit', exact: n };
+    return { ok: true, years: Math.max(1, Math.ceil(n - 1e-9)), exact: n, reached: false };
+  }
+
+  /**
+   * 反解每年投入：目标月均 T + 年数 N → 每年需要投多少（元/年）。
+   * 对 X 是**一元一次**（B_N 关于 X 线性），所以是闭式解，不需要迭代。
+   * ok=false 时 reason ∈ 'no-growth' | 'beyond-limit'，同样不得改写参数。
+   */
+  function forecastSolveInvest(cfg, baseDividend, targetMonthly) {
+    var c = normalizeForecast(cfg);
+    var y = c.yieldPct / 100, r = c.reinvestPct / 100, N = c.years;
+    var P0 = Math.max(0, U.n0(baseDividend));
+    var need = U.n0(targetMonthly) * 12;
+    if (need <= P0) return { ok: true, annualInvest: 0, reached: true };
+    if (y <= 0) return { ok: false, reason: 'no-growth' };
+    var B = (need - P0) / y;
+    var a = 1 + r * y;
+    var X;
+    if (Math.abs(a - 1) < 1e-12) {
+      X = (B - r * P0 * (N - 1)) / N;
+    } else {
+      var p = Math.pow(a, N - 1);
+      X = (B - r * P0 * (p - 1) / (a - 1)) / (p + (p - 1) / (a - 1));
+    }
+    if (!isFinite(X)) return { ok: false, reason: 'no-growth' };
+    if (X <= 0) return { ok: true, annualInvest: 0, reached: true };
+    if (X > FORECAST.investMaxYuan) return { ok: false, reason: 'beyond-limit', exact: X };
+    return { ok: true, annualInvest: X, reached: false };
+  }
+
+  /** 月均拆分：总数与「现有持仓」各自取整后**做差**得到「新投入」，
+   *  保证 现有持仓 + 新投入 == 总数（不会出现差 1 元的观感矛盾） */
+  function forecastSplit(totalMonthly, existingMonthly) {
+    var total = Math.round(U.n0(totalMonthly));
+    var exist = Math.min(total, Math.max(0, Math.round(U.n0(existingMonthly))));
+    return { total: total, existing: exist, fromNew: total - exist };
+  }
+
   /* ---------------- 股息统计 ---------------- */
 
   function stats(state, accountId) {
@@ -7904,6 +8131,14 @@ XJ.calc = (function () {
     milestone: milestone,
     MILESTONES: MILESTONES,
     projection: projection,
+    FORECAST: FORECAST,
+    normalizeForecast: normalizeForecast,
+    forecastRows: forecastRows,
+    forecastPoolAt: forecastPoolAt,
+    forecastDividendAt: forecastDividendAt,
+    forecastSolveYears: forecastSolveYears,
+    forecastSolveInvest: forecastSolveInvest,
+    forecastSplit: forecastSplit,
     stats: stats,
     monthDetail: monthDetail,
     applyAutoReceived: applyAutoReceived,
@@ -8548,9 +8783,63 @@ XJ.views.overview = (function () {
       '<div class="hd-badge">基于 <b>' + s.count + '</b> 只持仓<br>' + mult + '</div>' +
       '</div>' +
       (collapsed ? '' : '<div class="hd-metrics">' + metrics + '</div>') +
+      (collapsed ? '' : forecastStrip(st, s)) +
       '<div class="hd-collapsed-hint">已收起 · 点下方「展开」查看全部指标</div>' +
       '<div class="hd-actions">' + actions + '</div>' +
       '</div>';
+  }
+
+  /* ---------------- 深色卡「测算带」 ----------------
+   * 「在当前持仓下，每年投入 X 万、买入 y% 股息率的股票，N 年后月均预测分红约 Z」。
+   *
+   * Z 是**派生量**：永远等于 f(X, y, N, r) 的计算结果，不单独存储。
+   * 编辑它只是「取目标 → 反解 N 或 X → 写回参数 → 重新正算」，
+   * 所以界面上不可能出现与参数自相矛盾的数字（这是需求里「不允许计算矛盾」的落法）。
+   * 口径与公式见 calc.js 的 forecastRows 注释；与「展望未来」是两套独立模型。 */
+  function wanText(yuan) {
+    return String(Math.round(U.n0(yuan) / 1000) / 10);   // 元 → 万，保留 1 位小数
+  }
+
+  function forecastStrip(st, s) {
+    var cfg = st.state.settings.heroForecast || {};
+    var P0 = U.n0(s.totalPredicted);
+    var follow = (cfg.yieldPct === null || cfg.yieldPct === undefined);
+    var mvYield = U.n0(s.marketYield);
+    /* 未手改过 → 跟随组合市值息率；组合还没有市值数据时按 4% 假设（口径说明里写明） */
+    var yPct = follow ? (mvYield > 0 ? mvYield : 4) : U.n0(cfg.yieldPct);
+
+    var fc = XJ.calc.forecastRows({
+      annualInvest: cfg.annualInvest, yieldPct: yPct,
+      years: cfg.years, reinvestPct: cfg.reinvestPct,
+    }, P0);
+    var split = XJ.calc.forecastSplit(fc.monthly, P0 / 12);
+    var solveFor = cfg.solveFor === 'invest' ? 'invest' : 'years';
+
+    function numBtn(k, text) {
+      return '<button class="hf-num" data-act="editForecast" data-k="' + k + '">' + U.esc(text) + '</button>';
+    }
+
+    return '<div class="hd-forecast">' +
+      '<div class="hf-line">在当前持仓下，每年投入' +
+      numBtn('annualInvest', wanText(fc.cfg.annualInvest)) + '万，买入' +
+      numBtn('yieldPct', yPct.toFixed(1) + '%') + ' 股息率的股票，' +
+      numBtn('years', String(fc.cfg.years)) + '年后月均预测分红约' +
+      numBtn('monthly', U.moneySign(split.total, 0)) + '</div>' +
+      '<div class="hf-sub">其中现有持仓 ' + U.moneySign(split.existing, 0) +
+      ' + 新投入 ' + U.moneySign(split.fromNew, 0) +
+      '<span class="hf-dot">·</span>分红再投' +
+      numBtn('reinvestPct', String(Math.round(fc.cfg.reinvestPct)) + '%') + '</div>' +
+      '<div class="hf-foot">' +
+      '<span class="hf-solve">编辑月均时反解' +
+      '<button class="hf-chip' + (solveFor === 'years' ? ' active' : '') +
+      '" data-act="setForecastSolve" data-v="years">年数</button>' +
+      '<button class="hf-chip' + (solveFor === 'invest' ? ' active' : '') +
+      '" data-act="setForecastSolve" data-v="invest">每年投入</button></span>' +
+      '<button class="hf-link" data-act="forecastDetail">逐年明细 ›</button>' +
+      C.qmark('假设：现有持仓按当前「预测年度分红」保持不变；每年新投入与再投部分按你填的股息率生息；' +
+        '再投发生在年末，从次年起才计息。股息率未手动设置时跟随当前组合市值息率（组合还没有市值数据时按 4% 假设）。' +
+        '这里是按你设定的假设做的推演，与「发现 · 展望未来」是两套口径（那边把期初息率作用于全部资产），不代表实际收益。') +
+      '</div></div>';
   }
 
   /* ---------------- 分红覆盖 ---------------- */
@@ -11556,6 +11845,162 @@ XJ.views.symbol = (function () {
     S.commit(function (s) { s.settings.heroMetrics = keys; });
     UI.closeSheet();
     UI.toast('已保存');
+  });
+
+  /* ---------------- 深色卡「测算带」：编辑参数 / 反解 / 逐年明细 ----------------
+   * 月均是派生量（= f(每年投入, 股息率, 年数, 再投比例)），不存储；
+   * 编辑月均 = 拿目标去反解「年数」或「每年投入」并写回参数，反解失败则一个参数都不动。
+   */
+
+  /** 当前测算上下文（把「跟随市值息率」解析成具体数字） */
+  function forecastCtx() {
+    var st = S.state;
+    var cfg = st.settings.heroForecast || {};
+    var s = C.summary(st, S.acc());
+    var follow = (cfg.yieldPct === null || cfg.yieldPct === undefined);
+    var mvYield = U.n0(s.marketYield);
+    return {
+      cfg: cfg,
+      baseDividend: U.n0(s.totalPredicted),
+      yieldPct: follow ? (mvYield > 0 ? mvYield : 4) : U.n0(cfg.yieldPct),
+    };
+  }
+  function forecastCfgOf(ctx) {
+    return {
+      annualInvest: ctx.cfg.annualInvest, yieldPct: ctx.yieldPct,
+      years: ctx.cfg.years, reinvestPct: ctx.cfg.reinvestPct,
+    };
+  }
+  function forecastPatch(patch) {
+    S.commit(function (s) {
+      s.settings.heroForecast = Object.assign({}, s.settings.heroForecast, patch);
+    });
+  }
+  function forecastReason(res, which) {
+    if (res.reason === 'no-growth') return '股息率或投入为 0 时分红不会增长，无法反解';
+    if (res.reason === 'beyond-limit') {
+      return which === 'invest'
+        ? '按当前假设每年需投入 ' + (U.n0(res.exact) / 10000).toFixed(0) + ' 万，超出上限（10000 万）'
+        : '按当前假设需要约 ' + Math.ceil(U.n0(res.exact)) + ' 年，超出 50 年上限';
+    }
+    return '无法反解';
+  }
+
+  /* 可编辑字段：万元 / 百分比 / 年 —— 输入与存储单位不同，统一在这里换算 */
+  var HF_FIELDS = {
+    annualInvest: { title: '每年投入金额', unit: '万元', range: '0 – 10000 万', dec: 1,
+      get: function (c) { return U.n0(c.annualInvest) / 10000; },
+      set: function (v) { return U.clamp(v * 10000, 0, C.FORECAST.investMaxYuan); } },
+    yieldPct: { title: '股息率', unit: '%', range: '0 – 30%', dec: 1,
+      get: function (c, ctx) { return U.n0(ctx.yieldPct); },
+      set: function (v) { return U.clamp(v, 0, C.FORECAST.yieldMaxPct); } },
+    years: { title: '年数', unit: '年', range: '1 – 50 年', dec: 0,
+      get: function (c) { return U.n0(c.years) || 10; },
+      set: function (v) { return U.clamp(Math.round(v), C.FORECAST.yearsMin, C.FORECAST.yearsMax); } },
+    reinvestPct: { title: '分红再投比例', unit: '%', range: '0 – 100%', dec: 0,
+      get: function (c) { return U.n0(c.reinvestPct); },
+      set: function (v) { return U.clamp(v, 0, 100); } },
+  };
+
+  UI.on('editForecast', function (node) {
+    var key = node.getAttribute('data-k');
+    var ctx = forecastCtx();
+    var fc = C.forecastRows(forecastCfgOf(ctx), ctx.baseDividend);
+
+    /* 编辑「月均预测分红」= 给一个目标，反解年数或每年投入 */
+    if (key === 'monthly') {
+      var solveFor = ctx.cfg.solveFor === 'invest' ? 'invest' : 'years';
+      UI.openSheet({
+        title: '设定目标月均分红',
+        html: '<div class="tiny" style="line-height:1.7;margin-bottom:10px">' +
+          '填一个目标月均分红，系统会反解<b>' + (solveFor === 'invest' ? '每年投入金额' : '年数') +
+          '</b>并写回参数。当前月均约 ' + U.moneySign(U.n0(fc.monthly), 0) + '。</div>' +
+          UI.field('目标月均分红（元）',
+            UI.inputHtml('hfTarget', Math.round(U.n0(fc.monthly)), { inputmode: 'numeric' })) +
+          '<button class="btn-block" data-act="solveForecast">反解</button>' +
+          '<button class="btn-block ghost" data-act="closeSheet">取消</button>',
+      });
+      return;
+    }
+
+    var f = HF_FIELDS[key];
+    if (!f) return;
+    var cur = f.get(ctx.cfg, ctx);
+    var shown = cur.toFixed(f.dec);
+    UI.openSheet({
+      title: '修改' + f.title,
+      html: UI.field(f.title + '（' + f.unit + '）',
+        UI.inputHtml('hfVal', shown, { inputmode: f.dec ? 'decimal' : 'numeric' })) +
+        '<button class="btn-block" data-act="saveForecast" data-v="' + key + '">确定</button>' +
+        '<button class="btn-block ghost" data-act="closeSheet">取消</button>' +
+        '<div class="tiny" style="margin-top:8px">取值范围：' + U.esc(f.range) +
+        (key === 'yieldPct' ? '；改过之后不再跟随组合市值息率' : '') + '</div>',
+    });
+  });
+
+  UI.on('saveForecast', function (node) {
+    var key = node.getAttribute('data-v');
+    var f = HF_FIELDS[key];
+    var input = document.querySelector('.sheet [data-k="hfVal"]');
+    if (!f || !input) return;
+    var raw = U.num(input.value);
+    if (raw === null) return UI.toast('请输入一个数字');
+    var patch = {};
+    patch[key] = f.set(raw);
+    forecastPatch(patch);
+    UI.closeSheet();
+  });
+
+  UI.on('solveForecast', function () {
+    var input = document.querySelector('.sheet [data-k="hfTarget"]');
+    var target = input ? U.num(input.value) : null;
+    if (target === null || target < 0) return UI.toast('请输入一个有效的月均金额');
+    var ctx = forecastCtx();
+    var cfg = forecastCfgOf(ctx);
+    var solveFor = ctx.cfg.solveFor === 'invest' ? 'invest' : 'years';
+
+    if (solveFor === 'invest') {
+      var ri = C.forecastSolveInvest(cfg, ctx.baseDividend, target);
+      if (!ri.ok) return UI.toast(forecastReason(ri, 'invest'));
+      forecastPatch({ annualInvest: ri.annualInvest });
+      UI.closeSheet();
+      UI.toast(ri.reached ? '当前假设下已能达到该目标，每年投入已设为 0'
+        : '已把每年投入设为 ' + (ri.annualInvest / 10000).toFixed(1) + ' 万');
+      return;
+    }
+    var ry = C.forecastSolveYears(cfg, ctx.baseDividend, target);
+    if (!ry.ok) return UI.toast(forecastReason(ry, 'years'));
+    if (ry.reached) {
+      UI.closeSheet();
+      return UI.toast('当前持仓的分红已经达到该月均目标');
+    }
+    forecastPatch({ years: ry.years });
+    UI.closeSheet();
+    UI.toast('反解得 ' + ry.years + ' 年（精确 ' + ry.exact.toFixed(1) + ' 年）');
+  });
+
+  UI.on('setForecastSolve', function (node) {
+    forecastPatch({ solveFor: node.getAttribute('data-v') === 'invest' ? 'invest' : 'years' });
+  });
+
+  UI.on('forecastDetail', function () {
+    var ctx = forecastCtx();
+    var fc = C.forecastRows(forecastCfgOf(ctx), ctx.baseDividend);
+    var html = '<div class="tiny" style="line-height:1.7;margin-bottom:10px">' +
+      '现有持仓每年分红 ' + U.moneySign(ctx.baseDividend, 0) + ' 保持不变；每年投入 ' +
+      (U.n0(fc.cfg.annualInvest) / 10000).toFixed(1) + ' 万按 ' + ctx.yieldPct.toFixed(1) +
+      '% 生息；再投比例 ' + Math.round(U.n0(fc.cfg.reinvestPct)) + '%，再投于年末发生、从次年起才计息。' +
+      '</div>' +
+      '<div class="table-wrap"><table class="tbl"><thead><tr>' +
+      '<th>年份</th><th>当年分红</th><th>其中新投入</th><th>年末新钱资产</th></tr></thead><tbody>' +
+      fc.rows.map(function (r) {
+        return '<tr><td>第 ' + r.year + ' 年 <span class="tiny">' + r.calendarYear + '</span></td>' +
+          '<td class="c-div">' + U.moneySign(r.dividend, 0) + '</td>' +
+          '<td>' + U.moneySign(r.fromNew, 0) + '</td>' +
+          '<td>' + U.moneySign(r.assetsNew, 0) + '</td></tr>';
+      }).join('') +
+      '</tbody></table></div>';
+    UI.openSheet({ title: '逐年明细', html: html });
   });
 
   UI.on('explain', function (node) {
