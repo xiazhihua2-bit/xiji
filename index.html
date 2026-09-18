@@ -1086,6 +1086,130 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   .hc-sig{ font-size:9px; padding:1px 4px; }
 }
 
+/* ==================== 派息日弹窗（居中卡片） ====================
+   项目原本只有底部弹层（.sheet），这是第一个居中模态。
+   刻意**复用 .mask** 当遮罩 —— 点击关闭、UI.closeSheet() 清理、层级都沿用同一套，
+   只把内容换成 .pp-card 并覆盖掉 .sheet 的贴底布局。 */
+.mask.pp-mask{ align-items:center; padding:0 22px; }
+.pp-card{
+  width:100%; max-width:312px; box-sizing:border-box;
+  background:#FFFDF9; border-radius:22px;
+  padding:22px 18px 16px; text-align:center;
+  box-shadow:var(--shadow-lg);
+  animation:ppIn .26s cubic-bezier(.25,.9,.3,1.05);
+}
+@keyframes ppIn{ from{ transform:scale(.9) translateY(10px); opacity:0; } to{ transform:none; opacity:1; } }
+.pp-art{ position:relative; height:56px; margin-bottom:4px; }
+.pp-e1{ font-size:46px; line-height:56px; display:inline-block; }
+.pp-sp{ position:absolute; font-size:15px; opacity:0; }
+.pp-s1{ left:16%; top:6px; animation:ppFloat 1.9s ease-in-out .05s infinite; }
+.pp-s2{ left:29%; top:26px; animation:ppFloat 2.2s ease-in-out .35s infinite; }
+.pp-s3{ right:16%; top:6px; animation:ppFloat 2.0s ease-in-out .20s infinite; }
+.pp-s4{ right:29%; top:26px; animation:ppFloat 2.3s ease-in-out .50s infinite; }
+@keyframes ppFloat{
+  0%{ opacity:0; transform:translateY(4px) scale(.85); }
+  40%{ opacity:1; }
+  100%{ opacity:0; transform:translateY(-8px) scale(1); }
+}
+.pp-title{ font-size:16.5px; font-weight:600; letter-spacing:-.2px; }
+.pp-total{
+  font-size:33px; font-weight:700; color:var(--dividend);
+  letter-spacing:-1px; margin:6px 0 14px; font-variant-numeric:tabular-nums;
+  word-break:break-all;
+}
+.pp-rows{ display:flex; flex-direction:column; gap:6px; margin-bottom:16px; }
+.pp-row{
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  background:#FBF3E6; border-radius:10px; padding:10px 12px; font-size:13.5px;
+}
+.pp-nm{ color:var(--text); font-weight:550; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pp-amt{ color:var(--dividend); font-weight:650; font-variant-numeric:tabular-nums; flex:0 0 auto; }
+.pp-main{
+  display:block; width:100%; padding:13px; border-radius:999px;
+  background:linear-gradient(180deg,#F5A623,#EE8C1C); color:#fff;
+  font-size:15px; font-weight:600; letter-spacing:.3px;
+}
+.pp-main:active{ filter:brightness(.95); }
+.pp-ghost{ display:block; width:100%; padding:11px 0 2px; color:var(--text-3); font-size:14px; }
+.pp-ghost:active{ color:var(--text-2); }
+.pp-note{ font-size:11px; color:var(--text-3); line-height:1.6; margin-top:8px; }
+@media (prefers-reduced-motion: reduce){
+  .pp-card{ animation:none; }
+  .pp-sp{ animation:none; opacity:.9; }
+}
+
+/* ==================== 分红汇总页 ==================== */
+.ds-head{ font-size:22px; font-weight:700; letter-spacing:-.6px; margin:2px 0 12px; }
+.ds-ranges{
+  display:flex; gap:8px; overflow-x:auto; -webkit-overflow-scrolling:touch;
+  scrollbar-width:none; padding:0 0 12px; margin:0;
+}
+.ds-ranges::-webkit-scrollbar{ display:none; }
+.ds-ranges .chip{
+  flex:0 0 auto; padding:7px 15px; border-radius:999px;
+  font-size:13px; font-weight:550; color:var(--text-2);
+  background:rgba(120,120,128,.10); white-space:nowrap; transition:background .16s ease, color .16s ease;
+}
+.ds-ranges .chip.active{ background:var(--text); color:#fff; }
+.ds-custom{ display:flex; align-items:center; gap:8px; margin:-2px 0 12px; }
+.ds-custom input{
+  flex:1 1 0; min-width:0; padding:8px 10px; border-radius:10px;
+  background:var(--card); border:.5px solid var(--line);
+  font-size:13px; color:var(--text); font-family:inherit;
+}
+.ds-custom-sep{ font-size:12.5px; color:var(--text-3); flex:0 0 auto; }
+
+.ds-hero{ text-align:center; padding:20px 16px 16px; }
+.ds-cap{ font-size:12.5px; color:var(--text-2); }
+.ds-total{
+  font-size:34px; font-weight:700; color:var(--dividend);
+  letter-spacing:-1.2px; margin:4px 0 0; font-variant-numeric:tabular-nums;
+  word-break:break-all;
+}
+.ds-rule{ height:.5px; background:var(--line); margin:14px 0 10px; }
+.ds-kv{ display:flex; justify-content:space-between; font-size:13px; color:var(--text-2); padding:3px 0; }
+.ds-kv > span:last-child{ color:var(--text); font-variant-numeric:tabular-nums; }
+.ds-pend > span:last-child{ color:var(--pend-amt); }
+.ds-fun{
+  background:#FFF6E5; color:#8A6100; border-radius:10px;
+  padding:9px 12px; font-size:13px; font-weight:550; margin-top:12px;
+}
+.ds-quote{ font-size:12px; color:var(--text-3); margin-top:8px; }
+
+.ds-entry{ display:flex; align-items:center; gap:12px; width:100%; text-align:left; padding:14px 16px; }
+.ds-entry-v{ font-size:16px; font-weight:650; color:var(--dividend); font-variant-numeric:tabular-nums; flex:0 0 auto; }
+
+.ds-sym{ background:var(--card); border-radius:var(--radius); box-shadow:var(--shadow); margin-bottom:10px; overflow:hidden; }
+.ds-row{ display:flex; align-items:center; gap:8px; width:100%; text-align:left; padding:15px 16px; }
+.ds-row:active{ background:var(--card-2); }
+.ds-code{ font-size:14.5px; font-weight:650; font-variant-numeric:tabular-nums; flex:0 0 auto; }
+.ds-name{ font-size:14.5px; color:var(--text-2); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ds-sp{ flex:1 1 auto; min-width:8px; }
+.ds-amt{ font-size:16px; font-weight:650; color:var(--dividend); font-variant-numeric:tabular-nums; flex:0 0 auto; }
+.ds-sym .chev{ transition:transform .18s ease; }
+.ds-sym.open .chev{ transform:rotate(90deg); }
+.ds-detail{ border-top:.5px solid var(--line-2); padding:4px 16px 10px; background:var(--card-2); }
+.ds-rec{ display:flex; align-items:center; gap:8px; padding:8px 0; font-size:12px; border-bottom:.5px solid var(--line-2); }
+.ds-rec:last-child{ border-bottom:0; }
+.ds-rec-d{ color:var(--text-3); font-variant-numeric:tabular-nums; flex:0 0 auto; }
+.ds-rec-m{ color:var(--text-2); flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ds-rec-a{ color:var(--dividend); font-weight:600; font-variant-numeric:tabular-nums; flex:0 0 auto; }
+.ds-year{ margin-bottom:12px; }
+.ds-year:last-child{ margin-bottom:2px; }
+.ds-year-top{ display:flex; justify-content:space-between; font-size:13px; margin-bottom:5px; }
+.ds-year-amt{ font-weight:650; }
+.ds-note{ color:var(--text-3); line-height:1.7; margin-top:12px; }
+
+@media (max-width:360px){
+  .ds-head{ font-size:20px; }
+  .ds-total{ font-size:29px; }
+  .pp-card{ padding:18px 14px 14px; border-radius:20px; }
+  .pp-total{ font-size:28px; }
+  .pp-art{ height:48px; }
+  .pp-e1{ font-size:38px; line-height:48px; }
+}
+
+
 </style>
 </head>
 <body>
@@ -2095,6 +2219,12 @@ XJ.model = (function () {
         unsupportedDividend: [],         // 无分红数据源的标的（美股）
         indexCompare: ['sh', 'hs300', 'hsi'],   // 资产走势里默认勾选的对比指数
         showYieldBench: false,           // 股息率曲线里是否叠加「余额宝七日年化」基准线（默认关）
+        /* 派息日弹窗：最近一次已经弹过的日期（'YYYY-MM-DD'）。
+           当天弹过就不再打扰；存 settings 而不是 ui，是为了跨会话/跨设备导入后都不会重复弹。 */
+        payoutPopupAt: null,
+        /* 分红汇总里的趣味换算基准（可配置）：默认「视频会员 ¥25/月」。
+           monthly ≤ 0 时界面隐藏这一行。 */
+        dividendFun: { name: '视频会员', monthly: 25 },
       },
       quoteCache: {},       // symbol -> quote
       snapshots: {},        // 'YYYY-MM-DD' -> { mv, cost, pred, recv, fx }
@@ -6822,6 +6952,154 @@ XJ.calc = (function () {
       .sort(function (a, b) { return a.exDividendDate < b.exDividendDate ? -1 : 1; });
   }
 
+  /* ---------------- 派息日弹窗 + 分红汇总 ---------------- */
+
+  /**
+   * 某一天的派息事件（「今日分红到账」弹窗用）。
+   *
+   * 与「分红日历」完全同源（都走 calendarEvents），所以弹窗里的金额、名称、笔数
+   * 跟日历上看到的一定一致，不会出现「两处数字打架」。
+   * 注意 `estimated`：A 股的派息日在本项目里是**推算值**（= 除权除息日），
+   * 界面据此提示「实际到账可能晚 1-2 天」，不要当成确定事实。
+   */
+  function payoutsOn(state, accountId, date) {
+    var d = date || U.today();
+    var items = calendarEvents(state, accountId || ALL, d, d)
+      .filter(function (e) { return e.type === 'payout'; });
+    return {
+      date: d,
+      items: items,
+      count: items.length,
+      total: U.sum(items, function (e) { return U.n0(e.amount); }),
+      estimated: items.some(function (e) { return e.isEstimate; }),
+    };
+  }
+
+  /** 分红汇总的时间档位（界面按这个顺序渲染胶囊，calc 与视图共用一份，避免两边写死不同步） */
+  var DIVSUM_RANGES = [
+    { key: 'year', label: '今年' },
+    { key: 'y2', label: '近2年' },
+    { key: 'y5', label: '近5年' },
+    { key: 'all', label: '历史至今' },
+    { key: 'custom', label: '自定义' },
+  ];
+
+  /**
+   * 把档位解析成具体区间 [beg, end]。
+   *
+   *   今年   → 本年 01-01 ~ 本年 12-31
+   *   近2年  → 去年 01-01 ~ 本年 12-31     （近5年同理，往前 4 年）
+   *   历史至今 → 最早一条到账记录 ~ 今天
+   *   自定义 → 调用方给的起止
+   *
+   * 上界刻意取「年末」而不是「今天」：这样「今年」档的**预计到账**才能把本年剩余
+   * 还没发的分红算进来。而「历史至今」语义上不含未来，所以它的 end 就是今天
+   * —— 于是那一档预计恒为 0，符合预期。
+   */
+  function dividendRange(state, accountId, range, today) {
+    var t = today || U.today();
+    var y = U.yearOf(t) || 0;
+    var r = range || 'year';
+    var type = typeof r === 'string' ? r : (r.type || 'year');
+
+    if (type === 'custom') {
+      var b = (r && r.beg) || t, e = (r && r.end) || t;
+      return { type: 'custom', beg: b, end: e < b ? b : e };
+    }
+    if (type === 'all') {
+      var acc = accountId || ALL;
+      var min = null;
+      state.received.forEach(function (x) {
+        if (acc !== ALL && x.accountId !== acc) return;
+        var d = x.exDividendDate;
+        if (!d) return;
+        if (!min || d < min) min = d;
+      });
+      return { type: 'all', beg: min || (y + '-01-01'), end: t };
+    }
+    var back = type === 'y5' ? 4 : (type === 'y2' ? 1 : 0);
+    return { type: type, beg: (y - back) + '-01-01', end: y + '-12-31' };
+  }
+
+  /**
+   * 分红汇总（按任意时间区间切）。
+   *
+   * 与 calc.stats 的分工：stats 按自然年/月全量聚合、不支持区间（给旧的「股息统计」区块用）；
+   * 这个函数按 [beg, end] 取数，并把两种口径**分开**给：
+   *   total        —— 已到账（只可能 ≤ 今天），主数字用它，保证与「我的·分红流水」逐笔对得上
+   *   pendingTotal —— 区间内还没到账的预计，界面上单独一行，绝不混进主数字
+   */
+  function dividendSummary(state, accountId, range, today) {
+    var acc = accountId || ALL;
+    var t = today || U.today();
+    var rg = dividendRange(state, acc, range, t);
+    var endCap = rg.end < t ? rg.end : t;          // 已到账的上界还受「今天」约束
+
+    var records = state.received.filter(function (r) {
+      if (acc !== ALL && r.accountId !== acc) return false;
+      var d = r.exDividendDate;
+      return !!d && d >= rg.beg && d <= endCap;
+    }).sort(function (a, b) { return a.exDividendDate < b.exDividendDate ? -1 : 1; });
+
+    var bySymbol = {};
+    var byYear = {};
+    records.forEach(function (r) {
+      var g = bySymbol[r.symbol] ||
+        (bySymbol[r.symbol] = { symbol: r.symbol, amount: 0, count: 0, records: [] });
+      g.amount += U.n0(r.amount);
+      g.count++;
+      g.records.push(r);
+      var y = U.yearOf(r.exDividendDate);
+      if (y) byYear[y] = (byYear[y] || 0) + U.n0(r.amount);
+    });
+    var bySymbolList = Object.keys(bySymbol).map(function (k) { return bySymbol[k]; })
+      .sort(function (a, b) { return b.amount - a.amount; });
+    /* 年份从新到旧（原「股息统计」的年度汇总就是这个顺序） */
+    var years = Object.keys(byYear).map(Number).filter(function (n) { return !isNaN(n); })
+      .sort(function (a, b) { return b - a; });
+
+    /* 预计到账：今天之后、区间之内还要发的（「历史至今」档 end = 今天 → 恒空） */
+    var pending = [];
+    if (rg.end > t) {
+      pending = calendarEvents(state, acc, U.addDays(t, 1), rg.end)
+        .filter(function (e) { return e.type === 'payout'; });
+    }
+    var pendBy = {};
+    pending.forEach(function (e) {
+      var g = pendBy[e.symbol] || (pendBy[e.symbol] = { symbol: e.symbol, amount: 0, count: 0 });
+      g.amount += U.n0(e.amount);
+      g.count++;
+    });
+
+    return {
+      range: rg,
+      records: records,
+      count: records.length,
+      total: U.sum(records, function (r) { return U.n0(r.amount); }),
+      bySymbolList: bySymbolList,
+      byYear: byYear,
+      years: years,
+      pending: pending,
+      pendingCount: pending.length,
+      pendingTotal: U.sum(pending, function (e) { return U.n0(e.amount); }),
+      pendingList: Object.keys(pendBy).map(function (k) { return pendBy[k]; })
+        .sort(function (a, b) { return b.amount - a.amount; }),
+      firstDate: records.length ? records[0].exDividendDate : null,
+      lastDate: records.length ? records[records.length - 1].exDividendDate : null,
+    };
+  }
+
+  /**
+   * 「这些分红相当于 N 个月<换算对象>」的 N。
+   * 月费 ≤ 0 或分红为 0 时返回 null（界面据此隐藏这一行，不显示「相当于 0 个月」）。
+   */
+  function funEquivalent(total, monthly) {
+    var m = U.n0(monthly);
+    if (!(m > 0)) return null;
+    if (!(U.n0(total) > 0)) return null;
+    return Math.floor(U.n0(total) / m);
+  }
+
   /* ---------------- 每日资产快照 ---------------- */
 
   /**
@@ -8141,6 +8419,12 @@ XJ.calc = (function () {
     forecastSplit: forecastSplit,
     stats: stats,
     monthDetail: monthDetail,
+    /* v6 新增：派息日弹窗 + 分红汇总 */
+    payoutsOn: payoutsOn,
+    dividendRange: dividendRange,
+    dividendSummary: dividendSummary,
+    funEquivalent: funEquivalent,
+    DIVSUM_RANGES: DIVSUM_RANGES,
     applyAutoReceived: applyAutoReceived,
     historyRange: historyRange,
     dedupeDividends: dedupeDividends,
@@ -8246,6 +8530,11 @@ XJ.store = (function () {
       /* 平均股息率线的口径：year = 该财年整段窗口的均值（阶梯线）| cum = 自切换日起逐日累积。
          均线本身常亮、不可关闭，图例那一项点击是【换口径】而不是开关。 */
       yieldAvgMode: 'year',
+      /* 分红汇总页：时间档位（year|y2|y5|all|custom）、自定义起止、当前展开的标的 */
+      divsumRange: 'year',
+      divsumBeg: '',
+      divsumEnd: '',
+      divsumOpen: '',
     },
 
     init: function (state) {
@@ -9935,7 +10224,7 @@ XJ.views.plan = (function () {
   var U = XJ.util, UI = XJ.ui, C = XJ.views.common;
 
   /* ---------------- 息覆生活 ---------------- */
-  function renderCoverage(s, cov) {
+  function renderCoverage(s, cov, st) {
     var ms = XJ.calc.milestone(cov.overallProgress);
 
     var stepper = ms.all.map(function (m, i) {
@@ -9964,6 +10253,19 @@ XJ.views.plan = (function () {
       '<div class="kv"><span class="k">整体覆盖进度</span><span class="v">' + U.pct(cov.overallProgress, 1) + '</span></div>' +
       (ms.next ? '<div class="kv"><span class="k">下一目标</span><span class="v muted" style="font-weight:500">' + U.esc(ms.next.name) + '（覆盖率 ' + ms.next.pct + '%）</span></div>' : '') +
       '</div>';
+
+    /* 分红汇总入口卡 —— 刻意夹在「分红覆盖」与「下一个目标」之间。
+       若「下一个目标」卡不存在（cov.nextItem 为空），入口依然紧跟分红覆盖之后，位置不变。 */
+    var dsum = XJ.calc.dividendSummary(st.state, st.acc(), { type: 'year' });
+    html += '<button class="card ds-entry" data-act="openDivSum">' +
+      '<div class="row-main">' +
+      '<div class="row-t">分红汇总</div>' +
+      '<div class="row-s">今年已到账 ' + dsum.count + ' 笔' +
+      (dsum.pendingTotal > 0 ? ' · 另有 ' + U.moneySign(dsum.pendingTotal, 0) + ' 预计' : '') +
+      '</div></div>' +
+      '<span class="ds-entry-v">' + U.moneySign(dsum.total) + '</span>' +
+      '<span class="chev">' + UI.icon('chevron', 16, 2) + '</span>' +
+      '</button>';
 
     /* 反推加仓提示 */
     if (cov.nextItem) {
@@ -10045,55 +10347,9 @@ XJ.views.plan = (function () {
     return html;
   }
 
-  /* ---------------- 股息统计 ---------------- */
-  function renderStats(stats, acc) {
-    var html = '';
-
-    if (!stats.total) {
-      html += UI.emptyState('📊', '还没有股息到账记录',
-        '当已实施分配的分红方案过了除权除息日，系统会自动登记到账记录；你也可以在「我的」里手动补录。');
-      return html;
-    }
-
-    html += '<div class="card">' +
-      '<div class="card-head"><h2>股息统计</h2><div class="spacer"></div>' +
-      '<span class="hint">累计 ' + U.moneySign(stats.total) + '</span></div>' +
-      '<div class="kv"><span class="k">到账笔数</span><span class="v">' + stats.records.length + ' 笔</span></div>' +
-      '<div class="kv"><span class="k">涉及标的</span><span class="v">' + stats.bySymbolList.length + ' 只</span></div>' +
-      '<div class="kv"><span class="k">年度跨度</span><span class="v">' +
-      (stats.years.length ? (stats.years[stats.years.length - 1] + ' – ' + stats.years[0]) : '—') + '</span></div>' +
-      '</div>';
-
-    /* 年度汇总 */
-    var maxYear = Math.max.apply(null, stats.years.map(function (y) { return stats.byYear[y]; }).concat([1]));
-    html += '<div class="section-title">年度汇总</div>';
-    html += '<div class="card">' + stats.years.map(function (y) {
-      var amt = stats.byYear[y];
-      var w = Math.max(2, amt / maxYear * 100);
-      return '<div style="margin-bottom:12px">' +
-        '<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px">' +
-        '<span style="font-weight:600">' + y + ' 年</span>' +
-        '<span class="c-div" style="font-weight:650">' + U.moneySign(amt) + '</span></div>' +
-        '<div class="bar"><i style="width:' + w.toFixed(1) + '%"></i></div>' +
-        '</div>';
-    }).join('') + '</div>';
-
-    /* 按标的 */
-    var maxSym = Math.max.apply(null, stats.bySymbolList.map(function (x) { return x.amount; }).concat([1]));
-    html += '<div class="section-title">按标的</div>';
-    html += '<div class="card">' + stats.bySymbolList.map(function (x) {
-      var w = Math.max(2, x.amount / maxSym * 100);
-      return '<div style="margin-bottom:12px">' +
-        '<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px">' +
-        '<span style="font-weight:600">' + U.esc(XJ.store.symbolName(x.symbol)) +
-        '<span class="tiny" style="margin-left:6px">' + x.count + ' 笔</span></span>' +
-        '<span class="c-div" style="font-weight:650">' + U.moneySign(x.amount) + '</span></div>' +
-        '<div class="bar"><i style="width:' + w.toFixed(1) + '%"></i></div>' +
-        '</div>';
-    }).join('') + '</div>';
-
-    return html;
-  }
+  /* 原「股息统计」区块（年度汇总 + 按标的）已整体移除：
+     内容搬进了独立的「分红汇总」页（src/views/divsummary.js），入口就在上面那张分红汇总卡。
+     放在这里会让同一份数据在发现页渲染两遍。 */
 
   /* ---------------- 主渲染 ---------------- */
   function render() {
@@ -10110,11 +10366,167 @@ XJ.views.plan = (function () {
     }
 
     var cov = XJ.calc.coverage(s.totalPredicted, st.state.expenses, 7);
-    html += renderCoverage(s, cov);
+    html += renderCoverage(s, cov, st);
     html += '<div class="section-title">展望未来</div>';
     html += renderProjection(s, XJ.calc.projection(st.state.projection, s.totalMarketValue, s.totalPredicted), st.state.projection);
-    html += '<div class="section-title">股息统计</div>';
-    html += renderStats(XJ.calc.stats(st.state, st.acc()), st.acc());
+    /* 「股息统计」区块已移除 —— 内容整体搬进了独立的「分红汇总」页（入口就在上面的分红覆盖卡下面） */
+    return html;
+  }
+
+  return { render: render };
+})();
+
+
+/* ==================== src/views/divsummary.js ==================== */
+/* ==================== 视图：分红汇总（独立子页面） ====================
+ *
+ * 取代了原先挂在「发现」页底部的「股息统计」区块 —— 内容搬到这里，并且多了：
+ *   · 五个时间档位（今年 / 近2年 / 近5年 / 历史至今 / 自定义）
+ *   · 「已到账」与「预计到账」分开列（预计绝不混进主数字）
+ *   · 每只标的可展开的到账明细
+ *
+ * 口径全部来自 calc.dividendSummary（纯函数，verify.mjs 里有对应断言），
+ * 视图层只负责排版，不自己算钱。
+ */
+XJ.views.divsummary = (function () {
+  var U = XJ.util, UI = XJ.ui, C = XJ.views.common;
+
+  /* ---------------- 时间档位 ---------------- */
+  function chips(cur) {
+    return '<div class="ds-ranges">' + XJ.calc.DIVSUM_RANGES.map(function (r) {
+      return '<button class="chip' + (cur === r.key ? ' active' : '') +
+        '" data-act="setDivsumRange" data-v="' + r.key + '">' + U.esc(r.label) + '</button>';
+    }).join('') + '</div>';
+  }
+
+  function customRow(st) {
+    if (st.ui.divsumRange !== 'custom') return '';
+    return '<div class="ds-custom">' +
+      '<input type="date" data-change="setDivsumBeg" aria-label="起始日期" value="' +
+      U.esc(st.ui.divsumBeg || '') + '">' +
+      '<span class="ds-custom-sep">至</span>' +
+      '<input type="date" data-change="setDivsumEnd" aria-label="结束日期" value="' +
+      U.esc(st.ui.divsumEnd || '') + '">' +
+      '</div>';
+  }
+
+  /* ---------------- 主卡 ---------------- */
+  function hero(sum, fun) {
+    var n = XJ.calc.funEquivalent(sum.total, fun.monthly);
+    return '<div class="card ds-hero">' +
+      '<div class="ds-cap">分红总额</div>' +
+      '<div class="ds-total">' + U.moneySign(sum.total) + '</div>' +
+      '<div class="ds-rule"></div>' +
+      '<div class="ds-kv"><span>到账笔数</span><span>' + sum.count + ' 笔</span></div>' +
+      '<div class="ds-kv"><span>涉及标的</span><span>' + sum.bySymbolList.length + ' 只</span></div>' +
+      (sum.pendingTotal > 0
+        ? '<div class="ds-kv ds-pend"><span>另有预计到账</span><span>' +
+          U.moneySign(sum.pendingTotal) + '</span></div>'
+        : '') +
+      (n !== null
+        ? '<div class="ds-fun">这些分红相当于 ' + U.thousands(n) + ' 个月' +
+          U.esc(fun.name) + ' 🎵</div>'
+        : '') +
+      '<div class="ds-quote">这些都是你的持仓为你赚来的被动收入 🫰</div>' +
+      '</div>';
+  }
+
+  /* ---------------- 按标的（可展开到账明细） ---------------- */
+  function symList(sum, st) {
+    var open = st.ui.divsumOpen || '';
+    return '<div class="section-title">按标的</div>' +
+      sum.bySymbolList.map(function (g) {
+        var isOpen = open === g.symbol;
+        var rows = g.records.map(function (r) {
+          var qty = U.n0(r.qtyAtRecord);
+          return '<div class="ds-rec">' +
+            '<span class="ds-rec-d">' + U.esc(String(r.exDividendDate || '').slice(5)) + '</span>' +
+            '<span class="ds-rec-m">每股 ' + U.money(r.perShareAmount, 3) +
+            ' × ' + U.thousands(qty) + ' 股</span>' +
+            '<span class="ds-rec-a">' + U.moneySign(r.amount) + '</span>' +
+            '</div>';
+        }).join('');
+        return '<div class="ds-sym' + (isOpen ? ' open' : '') + '">' +
+          '<button class="ds-row" data-act="toggleDivsumSym" data-sym="' + U.esc(g.symbol) + '"' +
+          ' aria-expanded="' + (isOpen ? 'true' : 'false') + '">' +
+          '<span class="ds-code">' + U.esc(XJ.model.codeOf(g.symbol)) + '</span>' +
+          '<span class="ds-name">' + U.esc(st.symbolName(g.symbol)) + '</span>' +
+          '<span class="ds-sp"></span>' +
+          '<span class="ds-amt">' + U.moneySign(g.amount) + '</span>' +
+          '<span class="chev">' + UI.icon('chevron', 15, 2) + '</span>' +
+          '</button>' +
+          (isOpen ? '<div class="ds-detail">' + rows + '</div>' : '') +
+          '</div>';
+      }).join('');
+  }
+
+  /* ---------------- 按年（原「发现 · 股息统计」的年度汇总，搬到这里） ----------------
+     区间跨 2 个自然年以上才有意义，单年区间不占版面。 */
+  function yearBars(sum) {
+    if (sum.years.length < 2) return '';
+    var max = Math.max.apply(null, sum.years.map(function (y) { return sum.byYear[y]; }).concat([1]));
+    return '<div class="section-title">按年</div><div class="card">' +
+      sum.years.map(function (y) {
+        var amt = sum.byYear[y];
+        var w = Math.max(2, amt / max * 100);
+        return '<div class="ds-year">' +
+          '<div class="ds-year-top"><span>' + y + ' 年</span>' +
+          '<span class="c-div ds-year-amt">' + U.moneySign(amt) + '</span></div>' +
+          '<div class="bar"><i style="width:' + w.toFixed(1) + '%"></i></div>' +
+          '</div>';
+      }).join('') + '</div>';
+  }
+
+  /* ---------------- 主渲染 ---------------- */
+  function render() {
+    var st = XJ.store;
+    var html = '';
+    html += C.statusBanner();
+    html += C.accountSwitcher();
+
+    if (!st.hasAnyData()) {
+      html += UI.emptyState('📒', '还没有数据',
+        '先添加持仓。分红到账后系统会自动登记，这里就会汇总出来。',
+        '<button class="ghost-btn primary" data-act="openAddHolding">添加持仓</button>');
+      return html;
+    }
+
+    /* 档位校验：ui 里可能是旧值/脏值，一律退回「今年」 */
+    var key = st.ui.divsumRange;
+    var known = XJ.calc.DIVSUM_RANGES.some(function (r) { return r.key === key; });
+    if (!known) key = 'year';
+
+    var sum = XJ.calc.dividendSummary(st.state, st.acc(), {
+      type: key, beg: st.ui.divsumBeg, end: st.ui.divsumEnd,
+    });
+    var fun = (st.state.settings && st.state.settings.dividendFun) || { name: '视频会员', monthly: 25 };
+
+    html += '<div class="ds-head">分红汇总</div>';
+    html += chips(key);
+    html += customRow(st);
+
+    if (!(sum.total > 0) && !(sum.pendingTotal > 0)) {
+      html += UI.emptyState('🌾', '这个区间没有分红',
+        '换一个时间档位看看，或者在「我的 · 分红流水」里补录一笔。');
+      return html;
+    }
+
+    html += hero(sum, fun);
+
+    if (sum.total > 0) {
+      html += symList(sum, st);
+      html += yearBars(sum);
+    } else {
+      html += '<div class="card"><div class="tiny" style="line-height:1.8">' +
+        '这个区间还没有分红到账，另有 <b class="c-div">' + U.moneySign(sum.pendingTotal) +
+        '</b> 预计到账（' + sum.pendingCount + ' 笔）。到账后会自动登记在这里。</div></div>';
+    }
+
+    html += '<div class="tiny ds-note">' +
+      '口径：金额一律为<b>税前</b>；「分红总额」只统计<b>已到账</b>（与「我的 · 分红流水」逐笔一致），' +
+      '未到账的部分单列在「另有预计到账」里，不混进总额。' +
+      'A 股派息日按除权除息日推算，实际到账可能晚 1-2 天。' +
+      '</div>';
     return html;
   }
 
@@ -10290,6 +10702,12 @@ XJ.views.mine = (function () {
     html += '<button class="list-row" data-act="openReminderSetting">' +
       '<div class="row-main"><div class="row-t">分红提前提醒</div>' +
       '<div class="row-s">在除权除息日前 ' + U.n0(s.reminderLeadDays) + ' 天提示（需保持页面打开）</div></div>' +
+      '<span class="chev">' + UI.icon('chevron', 16) + '</span></button>';
+    html += '<button class="list-row" data-act="openDivFunSetting">' +
+      '<div class="row-main"><div class="row-t">🎁 分红换算基准</div>' +
+      '<div class="row-s">「分红汇总」里「相当于 N 个月 ___」的换算对象与月费（当前 ' +
+      U.esc((s.dividendFun && s.dividendFun.name) || '视频会员') + ' ¥' +
+      U.thousands(U.n0(s.dividendFun && s.dividendFun.monthly)) + '/月）</div></div>' +
       '<span class="chev">' + UI.icon('chevron', 16) + '</span></button>';
     html += '<button class="list-row" data-act="refreshLogos">' +
       '<div class="row-main"><div class="row-t">🏷 重新获取公司图标</div>' +
@@ -11122,6 +11540,7 @@ XJ.views.symbol = (function () {
     if (S.ui.subPage) {
       var subTitle = {
         analysis: '账户分析',
+        divsummary: '分红汇总',
         symbol: S.ui.subArg ? S.symbolName(S.ui.subArg) : '个股详情',
       }[S.ui.subPage] || '';
       return '<div class="topbar-row">' +
@@ -12360,6 +12779,110 @@ XJ.views.symbol = (function () {
      注意这不是「开/关」—— 均线常亮不可关闭，点图例只是换一条口径。 */
   UI.on('switchYieldAvg', function () {
     S.setUI({ yieldAvgMode: S.ui.yieldAvgMode === 'cum' ? 'year' : 'cum' });
+  });
+
+  /* ---------------- 派息日弹窗 + 分红汇总 ----------------
+   * 弹窗触发：当天有派息事件（口径与「分红日历」完全同源，都是 calc.calendarEvents 的 payout 事件）。
+   * 弹出频次：每天最多一次 —— 标记写进 settings.payoutPopupAt，跨会话 / 跨设备导入都不会重复弹。
+   * 刻意**不在 render 里弹**：分红方案是异步拉的，太早判断会「今天明明有派息却弹不出来」，
+   * 所以挂在 boot 的两个时点上各试一次（幂等）。 */
+  function payoutPopupHtml(p) {
+    var rows = p.items.map(function (e) {
+      return '<div class="pp-row">' +
+        '<span class="pp-nm">' + U.esc(e.name || XJ.model.codeOf(e.symbol)) + '</span>' +
+        '<span class="pp-amt">+' + U.moneySign(e.amount) + '</span>' +
+        '</div>';
+    }).join('');
+    return '<div class="pp-card" role="dialog" aria-label="今日分红到账">' +
+      '<div class="pp-art">' +
+      '<span class="pp-e1">🤑</span>' +
+      '<span class="pp-sp pp-s1">💛</span><span class="pp-sp pp-s2">✨</span>' +
+      '<span class="pp-sp pp-s3">💛</span><span class="pp-sp pp-s4">✨</span>' +
+      '</div>' +
+      '<div class="pp-title">今日分红到账</div>' +
+      '<div class="pp-total">+' + U.moneySign(p.total) + '</div>' +
+      '<div class="pp-rows">' + rows + '</div>' +
+      '<button class="pp-main" data-act="viewDivRecords">查看分红记录</button>' +
+      '<button class="pp-ghost" data-act="closeSheet">我知道了</button>' +
+      /* A 股的派息日在本项目里是推算值（= 除权除息日），必须如实说明，
+         否则用户发现钱没到会以为是 bug。只有确实是推算值时才显示这一行。 */
+      (p.estimated ? '<div class="pp-note">A 股派息日按除权除息日推算，实际到账可能晚 1-2 天。</div>' : '') +
+      '</div>';
+  }
+
+  function maybeShowPayoutPopup() {
+    try {
+      if (!S.state || !S.hasAnyData()) return;
+      if (document.querySelector('.pp-mask')) return;                 // 已经弹着
+      var today = U.today();
+      if (S.state.settings.payoutPopupAt === today) return;           // 今天弹过了
+      var p = C.payoutsOn(S.state, S.acc(), today);
+      /* 今天没有派息 → 既不弹、也**不记标记**（否则方案还没同步到就白白错过一整天） */
+      if (!p.items.length) return;
+      S.state.settings.payoutPopupAt = today;
+      XJ.storage.saveSoon(S.state);                                   // 直接落盘，不走 commit（那会触发整页重渲染）
+      var root = document.getElementById('modal-root');
+      if (!root) return;
+      var mask = document.createElement('div');
+      mask.className = 'mask pp-mask';
+      mask.innerHTML = payoutPopupHtml(p);
+      mask.addEventListener('click', function (e) { if (e.target === mask) UI.closeSheet(); });
+      root.appendChild(mask);
+    } catch (e) { console.warn('[payoutPopup]', e); }
+  }
+
+  UI.on('viewDivRecords', function () {
+    UI.closeSheet();
+    S.setUI({ subPage: 'divsummary', floatOpen: false });
+  });
+
+  UI.on('openDivSum', function () { S.setUI({ subPage: 'divsummary', floatOpen: false }); });
+
+  UI.on('setDivsumRange', function (node) {
+    var v = node.getAttribute('data-v');
+    var patch = { divsumRange: v, divsumOpen: '' };
+    /* 首次切到「自定义」时给个有意义的默认区间，否则会落到「今天~今天」的空结果 */
+    if (v === 'custom' && !S.ui.divsumBeg) {
+      patch.divsumBeg = U.yearOf(U.today()) + '-01-01';
+      patch.divsumEnd = U.today();
+    }
+    S.setUI(patch);
+  });
+
+  UI.on('toggleDivsumSym', function (node) {
+    var sym = node.getAttribute('data-sym');
+    S.setUI({ divsumOpen: S.ui.divsumOpen === sym ? '' : sym });
+  });
+
+  UI.on('setDivsumBeg', function (node) { S.setUI({ divsumBeg: node.value || '' }); });
+  UI.on('setDivsumEnd', function (node) { S.setUI({ divsumEnd: node.value || '' }); });
+
+  UI.on('openDivFunSetting', function () {
+    var fun = (S.state.settings && S.state.settings.dividendFun) || { name: '视频会员', monthly: 25 };
+    UI.openSheet({
+      title: '分红换算基准',
+      html:
+        '<div class="tiny" style="line-height:1.7;margin:-4px 0 12px">' +
+        '「分红汇总」页会把累计分红换算成「相当于 N 个月 ___」，这里改的就是那个换算对象与月费。' +
+        '月费填 0 或留空则隐藏那一行。</div>' +
+        UI.field('换算对象', UI.inputHtml('name', fun.name, { placeholder: '如：视频会员' })) +
+        UI.field('每月费用（元）', UI.inputHtml('monthly', fun.monthly, { inputmode: 'decimal' })) +
+        '<button class="btn-block" data-act="saveDivFun">保存</button>' +
+        '<button class="btn-block ghost" data-act="closeSheet">取消</button>',
+    });
+  });
+
+  UI.on('saveDivFun', function () {
+    var box = document.querySelector('.sheet');
+    var f = box ? UI.readFields(box) : {};
+    S.commit(function (s) {
+      s.settings.dividendFun = {
+        name: String(f.name || '').trim() || '视频会员',
+        monthly: U.n0(f.monthly),
+      };
+    });
+    UI.closeSheet();
+    UI.toast('已保存');
   });
 
   /* ---- 悬浮双入口 ---- */
@@ -14339,7 +14862,10 @@ XJ.views.symbol = (function () {
       render();
       /* 从带 #xjimport= 的链接打开 → 询问是否导入 */
       setTimeout(function () { checkImportHash(); }, 400);
-      syncAll({ silent: true });
+      /* 派息日弹窗：这里试一次（分红方案本地就有缓存，离线也能弹），
+         同步完成后再试一次兜底（首装 / 缓存过期时靠那次）。两次都幂等，不会重复弹。 */
+      setTimeout(maybeShowPayoutPopup, 600);
+      syncAll({ silent: true }).then(function () { maybeShowPayoutPopup(); });
       setInterval(function () {
         if (!document.hidden) syncAll({ silent: true });
       }, Math.max(60000, U.n0(S.state.settings.quoteRefreshMs) || 60000));
