@@ -1138,8 +1138,7 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   .pp-sp{ animation:none; opacity:.9; }
 }
 
-/* ==================== 分红汇总页 ==================== */
-.ds-head{ font-size:22px; font-weight:700; letter-spacing:-.6px; margin:2px 0 12px; }
+/* ==================== 分红汇总页 ==================== */.ds-head{ font-size:22px; font-weight:700; letter-spacing:-.6px; margin:2px 0 12px; }
 .ds-ranges{
   display:flex; gap:8px; overflow-x:auto; -webkit-overflow-scrolling:touch;
   scrollbar-width:none; padding:0 0 12px; margin:0;
@@ -1208,6 +1207,27 @@ table.tbl tbody tr:active{ background:var(--card-2); }
   .pp-art{ height:48px; }
   .pp-e1{ font-size:38px; line-height:48px; }
 }
+
+/* ==================== 当日参考盈亏 ==================== */
+/* 首页深色卡里的一行（在 hd-row 下方） */
+.hd-today{
+  display:flex; align-items:baseline; flex-wrap:wrap; gap:8px;
+  margin-top:8px; font-size:13.5px; font-weight:600;
+}
+.hd-today-note{ font-size:11px; font-weight:400; color:var(--hero-dim); }
+/* 首页深色卡里涨跌色要压过通用 .c-up/.c-down（那套是给浅底用的深色） */
+.hero-dark .hd-today .c-up{ color:#FF6B6B; }
+.hero-dark .hd-today .c-down{ color:#3ED47F; }
+/* 持仓卡片分时区里的一行「当日 ¥X」 */
+.hc-daypnl{
+  font-size:11px; font-weight:600; font-variant-numeric:tabular-nums;
+  margin-top:3px; white-space:nowrap;
+}
+.hc-daypnl.c-up{ color:var(--up); }
+.hc-daypnl.c-down{ color:var(--down); }
+/* 收益率口径胶囊行：贴着指标行，右对齐的独立一行 */
+.nw-retmodes{ padding-top:0; padding-bottom:6px; }
+
 
 
 </style>
@@ -3936,6 +3956,79 @@ XJ.fetcher = (function () {
     });
   }
 
+  /**
+   * 取「尽可能长」的日线收盘价序列（给资产走势曲线用）。
+   *
+   * 与 fetchPriceHistory 的区别：那个单次只取 640 根（≈2.5 年）；
+   * 这个按【两个窗口拼接】拿满约 10 年 —— 腾讯 fqkline 单次 `count` 上限 2000 根
+   * （≈8.2 年，2050 起直接空返回），但 `beg`/`end` 是生效的，所以拆成
+   * `[今天−8年, 今天]` 与 `[今天−11年, 今天−8年]` 两次请求再按日期合并。
+   * 实测 2601 根 / 10.7 年、无重复无缝隙（这套写法先在 fetchYieldHistory 里验证过）。
+   *
+   * 场外基金走天天基金净值走势（本身就是全量），不受窗口限制。
+   *
+   * @return { symbol: [[date, close], ...] }（升序，已按 maxBars 截尾）
+   */
+  var LONG_SPAN_DAYS = [0, 2920, 4020];   // 今天 / 8 年前 / 11 年前
+  var LONG_MAX_BARS = 2700;               // ≈10.7 年，再往上裁
+
+  function fetchLongCloseSeries(symbols, opts) {
+    opts = opts || {};
+    var list = (symbols || []).filter(function (s, i, a) {
+      return s && a.indexOf(s) === i && (XJ.market.hasDailyHistory(s) || XJ.market.assetType(s) === 'of');
+    });
+    if (!list.length) return Promise.resolve({});
+    var codes = opts.codes || {};
+    var today = opts.today || U.today();
+    var maxBars = U.num(opts.maxBars) || LONG_MAX_BARS;
+    var wins = [
+      { beg: U.addDays(today, -LONG_SPAN_DAYS[1]), end: today, count: 2000 },
+      { beg: U.addDays(today, -LONG_SPAN_DAYS[2]), end: U.addDays(today, -LONG_SPAN_DAYS[1]), count: 900 },
+    ];
+    var out = {};
+    var i = 0;
+
+    function trim(pts) {
+      pts = XJ.model.normCloseSeries(pts);
+      if (pts.length > maxBars) pts = pts.slice(-maxBars);
+      return pts;
+    }
+    function step() {
+      if (i >= list.length) return Promise.resolve(out);
+      var sym = list[i++];
+      if (XJ.market.assetType(sym) === 'of') {
+        return fetchFundNav(sym).catch(function () { return []; }).then(function (pts) {
+          pts = trim(pts);
+          if (pts.length >= 2) out[sym] = pts;
+        }).then(function () {
+          if (i >= list.length) return out;
+          return new Promise(function (r) { setTimeout(r, 120); }).then(step);
+        });
+      }
+      /* 窗口逐个串行取，窗口之间也留间隔，避免被限流 */
+      var rows = [], w = 0;
+      function nextWindow() {
+        if (w >= wins.length) return Promise.resolve();
+        var win = wins[w++];
+        return fetchKlineBars(sym, 'day', win.count, codes[sym], win.beg, win.end)
+          .catch(function () { return []; })
+          .then(function (bars) {
+            (bars || []).forEach(function (b) { rows.push([b.d, b.c]); });
+            return new Promise(function (r) { setTimeout(r, 120); }).then(nextWindow);
+          });
+      }
+      return nextWindow().then(function () {
+        var pts = trim(rows);
+        if (pts.length >= 2) out[sym] = pts;
+      }).then(function () {
+        if (onHistoryTick) onHistoryTick(i, list.length, sym);
+        if (i >= list.length) return out;
+        return new Promise(function (r) { setTimeout(r, 150); }).then(step);
+      });
+    }
+    return step();
+  }
+
   var onHistoryTick = null;
   function setHistoryProgress(fn) { onHistoryTick = fn; }
 
@@ -4539,6 +4632,8 @@ XJ.fetcher = (function () {
     fetchKlineBars: fetchKlineBars,
     fetchKlineBundle: fetchKlineBundle,
     fetchYieldHistory: fetchYieldHistory,
+    fetchLongCloseSeries: fetchLongCloseSeries,
+    LONG_MAX_BARS: LONG_MAX_BARS,
     parseSevenDay: parseSevenDay,
     fetchBenchSevenDay: fetchBenchSevenDay,
     parseFundNav: parseFundNav,
@@ -6430,6 +6525,7 @@ XJ.calc = (function () {
 
     var totalMarketValue = 0, totalCost = 0, totalPredicted = 0,
       totalRealized = 0, missingQuote = 0;
+    var totalTodayPnl = 0, totalPrevMv = 0;
 
     /* ★ 一律用人民币口径的字段（holdings 里已按各标的币种折好）。
        早先这里直接累加 h.marketValue / h.costValue（原币），
@@ -6441,6 +6537,15 @@ XJ.calc = (function () {
       totalRealized += h.realizedCny;
       if (h.marketValue === null) missingQuote++;
       else totalMarketValue += h.marketValueCny;
+
+      /* 当日参考盈亏 = Σ 持股数 ×（现价 − 昨收）× 汇率（跨币种已折算）。
+         缺昨收的标的（新加的、行情还没回）直接跳过 —— 绝不拿 0 当昨收，那会算出 +∞。 */
+      var pc = U.num(h.prevClose), px = U.num(h.price);
+      if (pc !== null && pc > 0 && px !== null && h.qty > 0) {
+        var fr = U.n0(h.fxRate) || 1;
+        totalTodayPnl += (px - pc) * h.qty * fr;
+        totalPrevMv += pc * h.qty * fr;
+      }
     });
 
     /* 分红同样按「该标的的币种」折算（港币分红不能当人民币加） */
@@ -6503,6 +6608,10 @@ XJ.calc = (function () {
       missingQuote: missingQuote,
       nextPayout: nextPayout,
       upcomingCount: ups.length,
+      /* 当日参考盈亏：现价相对【昨收】的浮动，人民币口径；不含当日已到账分红。
+         todayPnlPct = ÷ 昨收市值（= 组合当日涨跌幅），分母 ≤ 0 时为 null。 */
+      todayPnl: Math.round(totalTodayPnl * 100) / 100,
+      todayPnlPct: totalPrevMv > 0 ? Math.round(totalTodayPnl / totalPrevMv * 10000) / 100 : null,
     };
   }
 
@@ -7653,7 +7762,8 @@ XJ.calc = (function () {
       perSym[sym] = {
         txs: stx.sort(cmpTx),
         method: meta.costMethod || defaultCostMethod(),
-        received: U.sum(recs, function (r) { return r.amount; }),
+        /* 注意：这里**不预存**「全量分红合计」—— 分红摊薄成本必须用截至当日已到账的分红
+           （receivedOn(recs, d)），用全量会把「未来才到账的分红」提前摊进历史成本。 */
         recs: recs,
         currency: XJ.market.currency(sym),
         points: priceMap[sym],
@@ -7679,7 +7789,7 @@ XJ.calc = (function () {
         var info = perSym[sym];
         var px = priceOn(info.points, d);
         if (px === null) return;
-        var pos = position(info.txs, d, info.method, info.received);
+        var pos = position(info.txs, d, info.method, receivedOn(info.recs, d));
         if (pos.qty <= 0) return;
         var rate = fxRate(info.currency, fx);
         mv += pos.qty * px * rate;
@@ -8246,12 +8356,25 @@ XJ.calc = (function () {
    * @param {Array} holdings  [{ symbol, qty, currency }]
    * @param {Object} minutes  { [symbol]: { points: [{ t:'09:30', p:16.2 }] } }
    * @param {Function} rateFn 币种 → 汇率（可选，默认恒为 1）
-   * @return {{ points: [{ t, mv, filled }], missing: [symbol] }}
-   *   points[].mv     = 该时刻 Σ(持股数 × 价格 × 汇率)
-   *   points[].filled = 该时刻有多少只标的用了前值填充（供调试与断言）
-   *   missing         = 完全没有可用分时数据的标的
+   * @param {Object} opts     （可选，**缺省时行为与旧版逐字节一致**）
+   *        opts.full    true → 额外计算「相对昨收」的当日盈亏与全组合昨收市值基准
+   *        opts.prev    { symbol: 昨收 }（原币）。缺失时退化为该标的【首个分时价】，
+   *                     即它对当日的贡献从 0 起算，不会污染组合
+   * @return {{ points: [{ t, mv, filled, pnl?, pending? }], missing: [symbol], base? }}
+   *   points[].mv      = 该时刻 Σ(持股数 × 价格 × 汇率)
+   *   points[].filled  = 该时刻有多少只标的用了前值填充（有分时、但不是恰好命中该时刻）
+   *   points[].pending = （full）该时刻之前【完全没有报价】的标的数 —— 与 filled 语义不同，
+   *                      典型场景是 A 股 09:30 时美股还没开盘（21:30）
+   *   points[].pnl     = （full）该时刻 Σ 持股数 ×(价格 − 昨收)× 汇率 = 当日参考盈亏
+   *   base             = （full）Σ 持股数 × 昨收 × 汇率 = 【全组合】昨收市值
+   *                      ★ 这就是当日收益率该用的分母：旧的「首个时刻的 mv」只含当时已开盘的标的，
+   *                        组合里有跨时区标的时会让分母偏小、收益率被放大数倍
+   *   missing          = 完全没有可用分时数据的标的
    */
-  function alignMinute(holdings, minutes, rateFn) {
+  function alignMinute(holdings, minutes, rateFn, opts) {
+    opts = opts || {};
+    var full = !!opts.full;
+    var prevMap = opts.prev || {};
     var rate = typeof rateFn === 'function' ? rateFn : function () { return 1; };
     var hs = (holdings || []).filter(function (h) {
       return h && h.symbol && U.num(h.qty) !== null;
@@ -8266,12 +8389,26 @@ XJ.calc = (function () {
       var pts = (m && m.points) ? m.points.filter(function (p) {
         return p && p.t && U.num(p.p) !== null;
       }) : [];
-      if (pts.length < 2) { missing.push(h.symbol); return; }
-      pts = pts.slice().sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
-      pts.forEach(function (p) { tset[p.t] = 1; });
-      series.push({ symbol: h.symbol, qty: U.num(h.qty), rate: U.num(rate(h.currency)) || 1, pts: pts });
+      if (pts.length < 2) { missing.push(h.symbol); }
+      else {
+        pts = pts.slice().sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
+        pts.forEach(function (p) { tset[p.t] = 1; });
+      }
+      /* 默认模式：没有分时的标的完全不进 series（与旧版逐字节一致）；
+         full 模式：让它留在 series 里占「昨收」权重（当日盈亏贡献 0），
+         这样 base 才是【全组合】的昨收市值，而不是「当时已开盘那几只」的。 */
+      if (pts.length < 2 && !full) return;
+      var prev = U.num(prevMap[h.symbol]);
+      if (prev === null && pts.length) prev = U.num(pts[0].p);   // 兜底：从 0 起算，不污染组合
+      series.push({
+        symbol: h.symbol, qty: U.num(h.qty),
+        rate: U.num(rate(h.currency)) || 1,
+        pts: pts.length >= 2 ? pts : [], prev: prev,
+      });
     });
-    if (!series.length) return { points: [], missing: missing };
+    if (!series.length) {
+      return full ? { points: [], missing: missing, base: 0 } : { points: [], missing: missing };
+    }
 
     /* "HH:MM" 的字典序即时间序 */
     var times = Object.keys(tset).sort();
@@ -8281,25 +8418,45 @@ XJ.calc = (function () {
     var lastPrice = {};   // symbol → 最后一个有效价格（前值填充用）
     series.forEach(function (s) { cursor[s.symbol] = -1; });
 
+    /* full：全组合昨收市值 —— 当日收益率的分母 */
+    var base = 0;
+    if (full) {
+      series.forEach(function (s) { if (s.prev !== null) base += s.qty * s.prev * s.rate; });
+    }
+
     times.forEach(function (t) {
-      var sum = 0, filled = 0, live = 0;
+      var sum = 0, filled = 0, live = 0, pending = 0, pnl = 0;
       series.forEach(function (s) {
         var i = cursor[s.symbol];
         /* 指针只前进：把所有 t' <= t 的点吃掉，最后一个即为该时刻的有效价 */
         while (i + 1 < s.pts.length && s.pts[i + 1].t <= t) { i++; lastPrice[s.symbol] = s.pts[i].p; }
         cursor[s.symbol] = i;
         var price = lastPrice[s.symbol];
-        if (price === null || price === undefined) return;   // 该标的在此刻之前完全没有数据
+        if (price === null || price === undefined) {
+          /* 该标的在此刻之前完全没有报价（尚未开盘 / 当天停牌）。
+             mv 里不含它（与旧版一致）；full 模式记一笔 pending，而它在 base 里已占权重，
+             于是「分子贡献 0 + 分母含它」= 按常量参与，不会把收益率放大。 */
+          if (full && s.prev !== null) pending++;
+          return;
+        }
         live++;
         if (i >= 0 && s.pts[i].t !== t) filled++;            // 用了前值填充（不是恰好命中该时刻）
         sum += s.qty * price * s.rate;
+        if (full && s.prev !== null) pnl += s.qty * (price - s.prev) * s.rate;
       });
       /* 一个标的都没覆盖到的时刻没有意义，跳过（极少数标的停牌的时段） */
       if (!live) return;
-      out.push({ t: t, mv: sum, filled: filled });
+      var pt = { t: t, mv: sum, filled: filled };
+      if (full) {
+        pt.pending = pending;
+        pt.pnl = Math.round(pnl * 100) / 100;
+      }
+      out.push(pt);
     });
 
-    return { points: out, missing: missing };
+    return full
+      ? { points: out, missing: missing, base: Math.round(base * 100) / 100 }
+      : { points: out, missing: missing };
   }
 
   /**
@@ -8316,22 +8473,32 @@ XJ.calc = (function () {
    *      早就这么写的结果：一个含 5 万元场外基金的组合，当日净资产比真实值少了 4 万。
    *
    * @param minuteSymbols 真正参与当日分时曲线的标的（= 持仓标的 − alignMinute 的 missing）
+   * @param includedSymbols 参与计算的标的集合，**必须与 marketValueSeries 的 `used` 一致**
+   *        （即「有日线」的标的）。不传则不过滤（旧行为）。
+   *        不拉齐集合的后果：「无日线但有分红」的标的会被这里算进常量项、
+   *        在日粒度曲线里却完全不存在 → 两条累计收益打架。
    */
-  function netWorthAdjust(state, accountId, minuteSymbols) {
+  function netWorthAdjust(state, accountId, includedSymbols, minuteSymbols) {
     var acc = accountId || ALL;
+    var inc = {};
+    (includedSymbols || []).forEach(function (s) { inc[s] = true; });
     var hasMinute = {};
     (minuteSymbols || []).forEach(function (s) { hasMinute[s] = true; });
     var fx = (state.settings && state.settings.fx) || {};
 
     var adj = 0;
     holdings(state, acc).forEach(function (h) {
+      if (includedSymbols && !inc[h.symbol]) return;
       var rate = fxRate(XJ.market.currency(h.symbol), fx);
       adj -= U.n0(h.netInvested) * rate;
-      /* 无分时的标的：它的市值全天是个常量，直接按现价补进来 */
-      if (!hasMinute[h.symbol]) adj += U.n0(h.marketValue);
+      /* 无分时的标的：它的市值全天是个常量，直接按现价补进来。
+         ★ 必须乘汇率 —— marketValue 是**原币**（holdings 的成对字段约定），
+           漏乘会让持有港/美股的组合当日累计收益少算「市值 ×(汇率−1)」。 */
+      if (!hasMinute[h.symbol]) adj += U.n0(h.marketValue) * rate;
     });
     (state.received || []).forEach(function (r) {
       if (acc !== ALL && r.accountId !== acc) return;
+      if (includedSymbols && !inc[r.symbol]) return;
       adj += U.n0(r.amount) * fxRate(XJ.market.currency(r.symbol), fx);
     });
     return adj;
@@ -8514,6 +8681,8 @@ XJ.store = (function () {
       nwBeg: '', nwEnd: '',     // 自定义区间
       nwMetric: 'mv',           // 资产走势指标：mv 持仓市值 | nw 净资产 | ret 收益率
       nwMode: 'line',           // 收益率画法：line 曲线 | candle K线（蜡烛为选中指数）
+      nwRetMode: 'twr',         // 收益率口径：twr 时间加权 | cost 成本收益率（累计收益 ÷ 累计净投入）
+      anNwRetMode: 'twr',       // 账户分析那张卡的同名控件（两实例状态独立）
       nwCollapsed: false,       // 资产走势卡片是否收起
       floatOpen: false,         // 悬浮双入口是否展开
       subPage: null,            // 子页面：null | 'analysis' | 'symbol'
@@ -9022,6 +9191,20 @@ XJ.views.overview = (function () {
   }
 
   /* ---------------- 年度分红卡（深色） ---------------- */
+  /**
+   * 当日参考盈亏（首页深色卡里的一行）。
+   * 口径 = 现价相对【昨收】的浮动，人民币、跨币种已折算；缺昨收的标的跳过。
+   * 文案刻意中性：只陈述数字，不给任何建议。
+   */
+  function todayPnlLine(s) {
+    if (s.todayPnl === null || s.todayPnl === undefined) return '';
+    var up = s.todayPnl >= 0;
+    return '<div class="hd-today"><span class="' + (up ? 'c-up' : 'c-down') + '">' +
+      (up ? '▲' : '▼') + ' 当日参考盈亏 ' + U.signMoney(s.todayPnl, 0) +
+      (s.todayPnlPct === null ? '' : ' · ' + U.signPct(s.todayPnlPct)) + '</span>' +
+      '<span class="hd-today-note">较昨收 · 跨币种已折算</span></div>';
+  }
+
   function heroCard(st, s, proj, stat) {
     var cfg = st.state.settings;
     var collapsed = !!cfg.heroCollapsed;
@@ -9071,6 +9254,10 @@ XJ.views.overview = (function () {
       '</div>' +
       '<div class="hd-badge">基于 <b>' + s.count + '</b> 只持仓<br>' + mult + '</div>' +
       '</div>' +
+      /* 当日参考盈亏：现价相对【昨收】的浮动（人民币口径，跨币种已折算）。
+         刻意放在 hd-row 下方独立一行、不塞进 HERO_METRICS —— 老用户的
+         settings.heroMetrics 里没有这个 key，塞进去会导致它默认不显示。 */
+      (collapsed ? '' : todayPnlLine(s)) +
       (collapsed ? '' : '<div class="hd-metrics">' + metrics + '</div>') +
       (collapsed ? '' : forecastStrip(st, s)) +
       '<div class="hd-collapsed-hint">已收起 · 点下方「展开」查看全部指标</div>' +
@@ -9225,6 +9412,8 @@ XJ.views.overview = (function () {
     if (showMin) {
       var prev = h.prevClose;
       var chgAmt = (h.price !== null && h.price !== undefined && prev) ? h.price - prev : null;
+      /* 当日参考盈亏（人民币口径）：持股数 ×（现价 − 昨收）× 该标的币种汇率 */
+      var dayPnl = (chgAmt !== null && h.qty > 0) ? chgAmt * h.qty * (U.n0(h.fxRate) || 1) : null;
       /* 现价与涨跌额都按 2 位小数（A 股行情惯例，也对齐参考图的「16.20 / -0.18」） */
       intra = '<div class="hc-intra">' +
         '<div class="hc-spark">' + XJ.chart.sparkline(min.points, { prevClose: prev }) + '</div>' +
@@ -9233,7 +9422,11 @@ XJ.views.overview = (function () {
         '<span class="' + U.dirClass(chgAmt) + '">' +
         (chgAmt === null ? '' : (chgAmt > 0 ? '+' : '') + U.money(chgAmt, 2)) + '</span>' +
         (minToday ? '' : '<i class="hc-at">' + U.esc(U.mdShort(min.date)) + '</i>') +
-        '</div></div>';
+        '</div>' +
+        /* 当日参考盈亏（金额）：持股数 ×（现价 − 昨收）× 汇率 —— 报价一变就跟着变 */
+        (dayPnl === null ? '' : '<div class="hc-daypnl ' + U.dirClass(dayPnl) + '">当日 ' +
+          U.signMoney(dayPnl, 0) + '</div>') +
+        '</div>';
     }
 
     /* 卡片主体是「进详情」按钮，删除是独立按钮 —— 不能嵌套 button */
@@ -9372,8 +9565,12 @@ XJ.views.overview = (function () {
 /* ==================== 视图组件：资产走势（首页独立卡） ====================
  * 三条曲线一键切换：
  *   持仓市值 —— Σ(持股数 × 当日真实收盘价/净值 × 汇率)
- *   净资产   —— 持仓总市值 + 累计已收分红 − 累计净投入
- *   收益率   —— 时间加权收益率（TWR），剔除加仓影响，可与指数公平对比
+ *   累计收益 —— 持仓总市值 + 累计已收分红 − 累计净投入
+ *               （**不等于**账户总资产：本项目没有现金概念，故不提供「总资产」曲线）
+ *   收益率   —— 两种口径可切：
+ *                 时间加权（TWR）剔除加仓/减仓的净流入，可与指数公平对比
+ *                 成本收益率 = 累计收益 ÷ 累计净投入，即「每一元本金赚了多少」
+ *   当日参考盈亏 —— 现价相对【昨收】的浮动（人民币口径，跨币种已折算）
  *
  * 收益率模式下叠加对比指数（上证 / 沪深300 / 恒生 / 纳斯达克 / 标普500；日经225 / 台湾加权 / 韩国KOSPI
  * 无免费历史源，整项不出现在图例里），
@@ -9392,8 +9589,9 @@ XJ.views.networth = (function () {
     ['today', '当日'], ['1m', '本月'], ['3m', '近三月'],
     ['6m', '近6月'], ['ytd', '今年'], ['all', '全部'], ['custom', '自定义'],
   ];
-  var METRICS = [['mv', '持仓市值'], ['nw', '净资产'], ['ret', '收益率']];
+  var METRICS = [['mv', '持仓市值'], ['nw', '累计收益'], ['ret', '收益率']];
   var MODES = [['line', '曲线收益率'], ['candle', 'K线收益率']];
+  var RET_MODES = [['twr', '时间加权'], ['cost', '成本收益率']];
 
   /* 同一张卡挂两处（首页 + 账户分析），每处一套**独立**的控件状态：
      ns = ''    → nwMetric / nwRange / nwGran / nwBeg / nwEnd / nwMode / nwCollapsed
@@ -9402,6 +9600,7 @@ XJ.views.networth = (function () {
   var NS_BASE = {
     metric: 'nwMetric', range: 'nwRange', gran: 'nwGran',
     beg: 'nwBeg', end: 'nwEnd', mode: 'nwMode', collapsed: 'nwCollapsed',
+    retMode: 'nwRetMode',
   };
   function keyOf(ns, field) {
     var base = NS_BASE[field];
@@ -9461,10 +9660,17 @@ XJ.views.networth = (function () {
     var res = XJ.calc.marketValueSeries(st.state, acc, priceMap, {
       beg: cr.beg, end: cr.end, fx: st.state.settings.fx,
     });
+    /* 成本收益率 = 累计收益 ÷ 累计净投入（每一元本金赚了多少，含股息）。
+       净投入 ≤ 0（本金已被卖出/分红全部收回）时没有意义 → 给 null，绝不给 Infinity。 */
+    var costRet = res.series.map(function (p) {
+      var net = U.n0(p.net);
+      return { date: p.date, idx: net > 0 ? U.n0(p.nw) / net : null };
+    });
     var value = {
       range: range, beg: cr.beg, end: cr.end, res: res,
       series: XJ.calc.downsample(res.series, gran),
       twr: XJ.calc.downsample(XJ.calc.twrIndex(res.series), gran),
+      costRet: XJ.calc.downsample(costRet, gran),
     };
     cache[key] = value;
     cacheOrder.push(key);
@@ -9491,6 +9697,9 @@ XJ.views.networth = (function () {
     var granLabel = gran === 'month' ? '月粒度' : '日粒度';
     var isPct = metric === 'ret';
     var isToday = b.range === 'today';
+    /* 收益率口径：twr（时间加权）| cost（成本收益率）。只影响收益率模式 */
+    var retMode = getUI(ns, 'retMode') === 'cost' ? 'cost' : 'twr';
+    var retLabel = retMode === 'cost' ? '成本收益率' : '时间加权';
 
     var html = '<div class="card nw-card' + (collapsed ? ' collapsed' : '') + '" data-ns="' + ns + '">';
 
@@ -9532,6 +9741,14 @@ XJ.views.networth = (function () {
       }).join('') + '</div>') +
       '</div>';
 
+    /* 收益率口径切换（只在收益率模式下出现）：时间加权 / 成本收益率 */
+    if (isPct) {
+      html += '<div class="nw-ranges nw-ranges-top nw-retmodes">' + RET_MODES.map(function (m) {
+        return '<button class="chip' + (m[0] === retMode ? ' active' : '') +
+          '" data-act="setNwRetMode" data-ns="' + ns + '" data-v="' + m[0] + '">' + m[1] + '</button>';
+      }).join('') + '</div>';
+    }
+
     /* 区间条（对齐参考图：当日/本月/近三月/近6月/今年/全部/自定义） */
     html += '<div class="nw-ranges nw-ranges-top">' + RANGES.map(function (r) {
       return '<button class="chip' + (r[0] === b.range ? ' active' : '') +
@@ -9559,8 +9776,18 @@ XJ.views.networth = (function () {
          早先只有收益率分支处理「当日」，另两种指标落到日粒度序列上——而「当日」区间下日序列
          只剩 1 个点，于是必然命中空态，看起来像「曲线不显示」。
          当日没有「共同起点」一说（横轴是时刻不是日期），故不计算 common。 */
-      chartSeries = buildIntraday(st, metric);
+      chartSeries = buildIntraday(st, metric, retMode);
       intradayMissing = buildIntraday.missing || [];
+    } else if (isPct && retMode === 'cost') {
+      /* 成本收益率：直接画【水平值】= 累计收益 ÷ 累计净投入。
+         刻意**不叠加指数** —— 指数没有「本金」概念，两者零点不同（组合从 0% 起步、
+         指数归一化到共同起点），叠在一起比会被误读。口径行里写明了。 */
+      chartSeries = [{
+        key: 'ret', name: '成本收益率', color: MK.METRIC_COLORS.ret,
+        points: b.costRet.filter(function (p) { return p.idx !== null; }).map(function (p) {
+          return { date: p.date, pct: Math.round(p.idx * 10000) / 100 };
+        }),
+      }];
     } else if (isPct) {
       /* 组合收益率：与指数取共同起点，才谈得上可比 */
       var idxPts0 = b.twr.map(function (p) { return { date: p.date, idx: p.idx }; });
@@ -9676,7 +9903,15 @@ XJ.views.networth = (function () {
 
     /* ---- 大数字 ---- */
     var delta = null;
-    if (isPct && !isToday) {
+    if (isPct && !isToday && retMode === 'cost') {
+      /* 成本收益率：大数字就是当前水平值（不是相对起点的变化） */
+      var crLast = b.costRet.length ? b.costRet[b.costRet.length - 1] : null;
+      var crv = crLast && crLast.idx !== null ? crLast.idx * 100 : null;
+      html += '<div class="nw-amount' + (crv !== null && crv < 0 ? ' down' : '') + '">' +
+        (crv === null ? '—' : U.signPct(crv)) + '</div>';
+      html += '<div class="tiny nw-sub">成本收益率 = 累计收益 ÷ 累计净投入（含股息）' +
+        (crLast ? ' · 截至 ' + U.esc(crLast.date) : '') + '</div>';
+    } else if (isPct && !isToday) {
       var lastIdx = b.twr.length ? b.twr[b.twr.length - 1] : null;
       var baseIdx = null;
       if (common) {
@@ -9711,8 +9946,17 @@ XJ.views.networth = (function () {
       var curP = lastT ? lastT.pct : null;
       html += '<div class="nw-amount' + (curP !== null && curP < 0 ? ' down' : '') + '">' +
         (curP === null ? '—' : U.signPct(curP)) + '</div>';
-      html += '<div class="tiny nw-sub">组合收益率（TWR，含股息）· 当日' + dayHint + '盘中' +
+      html += '<div class="tiny nw-sub">' +
+        (retMode === 'cost' ? '成本收益率 = 当日参考盈亏 ÷ 累计净投入' : '组合收益率（TWR，含股息）') +
+        ' · 当日' + dayHint + '盘中' +
         (lastT ? ' · 截至 ' + U.esc(lastT.date) : '') + '</div>';
+      /* 当日参考盈亏（金额）：相对昨收。用户明确要的就是这一行 */
+      var tpR = buildIntraday.todayPnl;
+      if (tpR) {
+        html += '<div style="margin-top:7px"><span class="nw-delta ' + (tpR.amount >= 0 ? 'up' : 'down') + '">' +
+          (tpR.amount >= 0 ? '▲' : '▼') + ' 当日参考盈亏 ' + U.signMoney(tpR.amount, 0) +
+          '</span> <span class="tiny">较昨收，跨币种已折算</span></div>';
+      }
       var idxRows = chartSeries.filter(function (s) { return s.key !== 'ret'; }).map(function (s) {
         var last = s.points[s.points.length - 1];
         return { name: s.name, pct: last ? last.pct : null, color: s.color };
@@ -9736,12 +9980,20 @@ XJ.views.networth = (function () {
           ? ' · 当日' + dayHint + '盘中 · 截至 ' + U.esc(chartSeries[0].points[chartSeries[0].points.length - 1].date)
           : (series.length ? ' · 截至 ' + U.esc(series[series.length - 1].date) : '')) + '</div>';
       if (isToday && chartSeries.length) {
-        /* 当日盘中变动：用曲线的首末点相减（不是日粒度的「较上日」） */
-        var firstP = chartSeries[0].points[0].pct;
-        var lastP = chartSeries[0].points[chartSeries[0].points.length - 1].pct;
-        var dToday = lastP - firstP;
-        html += '<div style="margin-top:7px"><span class="nw-delta ' + (dToday >= 0 ? 'up' : 'down') + '">' +
-          (dToday >= 0 ? '▲' : '▼') + ' 今日 ' + U.signMoney(dToday, 0) + '</span></div>';
+        /* 当日参考盈亏 = 相对【昨收】的浮动。
+           早先这里用「曲线首末点相减」，等于把隔夜跳空整段算漏了（9:30 开盘就跳空的话它记不到）。 */
+        var tpM = buildIntraday.todayPnl;
+        if (tpM) {
+          html += '<div style="margin-top:7px"><span class="nw-delta ' + (tpM.amount >= 0 ? 'up' : 'down') + '">' +
+            (tpM.amount >= 0 ? '▲' : '▼') + ' 当日参考盈亏 ' + U.signMoney(tpM.amount, 0) +
+            '</span> <span class="tiny">较昨收，跨币种已折算</span></div>';
+        } else {
+          var firstP = chartSeries[0].points[0].pct;
+          var lastP = chartSeries[0].points[chartSeries[0].points.length - 1].pct;
+          var dToday = lastP - firstP;
+          html += '<div style="margin-top:7px"><span class="nw-delta ' + (dToday >= 0 ? 'up' : 'down') + '">' +
+            (dToday >= 0 ? '▲' : '▼') + ' 今日 ' + U.signMoney(dToday, 0) + '</span></div>';
+        }
       } else if (series.length >= 2) {
         delta = XJ.calc.seriesDelta(series, metric);
         if (delta) {
@@ -9776,20 +10028,29 @@ XJ.views.networth = (function () {
     if (isToday) {
       notes.push('当日为分时曲线：按各标的的分钟报价对齐后累加，某只标的缺某个时刻的报价时沿用其前值');
       if (isPct) {
-        notes.push('涨跌幅以当日首个报价为基准；指数按同一基准归一化，可横向比较');
+        notes.push(retMode === 'cost'
+          ? '成本收益率 = 当日参考盈亏 ÷ 累计净投入（每一元本金今天赚了多少）'
+          : '涨跌幅以【昨收】为基准（与同花顺/券商一致），指数同样按昨收归一化；' +
+            '尚未开盘的标的在分子里贡献 0、在分母里照常占权重，所以不会把涨幅放大');
       } else if (metric === 'nw') {
-        notes.push('净资产 = 分时持仓总市值 + 累计已收分红 − 累计净投入（没有分时的标的按其最新市值计入）');
+        notes.push('累计收益 = 分时持仓总市值 + 累计已收分红 − 累计净投入（没有分时的标的按其最新市值、并按币种折算计入）');
       } else {
         notes.push('持仓市值按分时价格折算人民币；跨市场标的按设置里的汇率换算');
       }
     } else if (isPct) {
-      notes.push('收益率 = 时间加权收益率（TWR）：按日剔除加仓/减仓的净流入后再连乘，可与指数公平对比');
-      notes.push('指数涨幅按同一区间起点归一化；不同市场交易日不同，取共同起点');
+      if (retMode === 'cost') {
+        notes.push('成本收益率 = 累计收益 ÷ 累计净投入（含股息），即「每一元本金赚了多少」；' +
+          '刻意不叠加指数 —— 指数没有本金概念，两者零点不同，叠在一起比会被误读');
+      } else {
+        notes.push('收益率 = 时间加权收益率（TWR）：按日剔除加仓/减仓的净流入后再连乘，可与指数公平对比');
+        notes.push('指数涨幅按同一区间起点归一化；不同市场交易日不同，取共同起点');
+      }
       if (mode === 'candle' && candles && candles.length) {
         notes.push('蜡烛为「' + candleName + '」的收益率 K 线（组合没有 K 线，仍以折线显示）');
       }
     } else if (metric === 'nw') {
-      notes.push('净资产 = 持仓总市值 + 累计已收分红 − 累计净投入（分红再投会重复计入）');
+      notes.push('累计收益 = 持仓总市值 + 累计已收分红 − 累计净投入（分红再投会重复计入）。' +
+        '它**不等于**账户总资产 —— 本项目没有现金概念，故不提供「总资产」曲线');
     } else {
       notes.push('按「交易流水还原持股数 × 当日真实收盘价」折算人民币；同日有每日快照时以快照为准');
     }
@@ -9798,7 +10059,7 @@ XJ.views.networth = (function () {
     }
     if (isToday && intradayMissing && intradayMissing.length) {
       notes.push('有 ' + intradayMissing.length + ' 只标的没有当日分时（场外基金 / 美股 / 长期停牌），' +
-        '不参与逐分钟曲线' + (metric === 'nw' ? '（净资产里按其最新市值作为常量计入）' : '，未计入曲线'));
+        '不参与逐分钟曲线' + (metric === 'nw' ? '（累计收益里按其最新市值、并按币种折算作为常量计入）' : '，未计入曲线'));
     }
     html += '<div class="note-line" style="margin-top:8px">' + UI.icon('info', 13) +
       '<span>' + U.esc(notes.join('；')) + '</span></div>';
@@ -9816,52 +10077,135 @@ XJ.views.networth = (function () {
   }
 
   /**
+   * 每只标的的**昨收**（原币/股），当日盈亏与当日收益率的基准。
+   *
+   * 兜底链：行情给的 prevClose → 该标的日线最后一根收盘 → 现价。
+   * 三者都没有（新加的标的、行情还没回来）则该标的既不进分子也不进分母 ——
+   * 绝不用 0 当昨收，否则会算出 +∞ 的涨幅。
+   */
+  function prevCloseMap(st, hs) {
+    var m = {};
+    (hs || []).forEach(function (h) {
+      var v = U.num(h.prevClose);
+      if (v !== null && v > 0) { m[h.symbol] = v; return; }
+      var rec = st.state.priceHistory && st.state.priceHistory[h.symbol];
+      var pts = rec && rec.points;
+      if (pts && pts.length) {
+        v = U.num(pts[pts.length - 1][1]);
+        if (v !== null && v > 0) { m[h.symbol] = v; return; }
+      }
+      v = U.num(h.price);
+      if (v !== null && v > 0) m[h.symbol] = v;
+    });
+    return m;
+  }
+
+  /**
+   * 指数的「昨收」= 分时批次日之前最后一根日线收盘。
+   * 这样指数那条线与组合同为「较昨收」，跟同花顺的指数涨幅口径一致。
+   * 取不到时返回 null，调用方退化为「首个分时点」（保持旧行为）。
+   */
+  function indexPrevClose(st, key, minuteDate) {
+    var rec = st.state.indexHistory && st.state.indexHistory[key];
+    if (!rec || !rec.bars || !rec.bars.length || !minuteDate) return null;
+    var prev = null;
+    for (var i = 0; i < rec.bars.length; i++) {
+      if (rec.bars[i].d < minuteDate) prev = U.num(rec.bars[i].c);
+      else break;
+    }
+    return prev !== null && prev > 0 ? prev : null;
+  }
+
+  /**
+   * 与 calc.marketValueSeries 的 `used` **同源**：该账户下「有日线」的标的。
+   * 当日累计收益要和日粒度对齐，两边就必须用同一个标的集合 ——
+   * 否则「有日线但无分时」（场外基金）和「无日线但有分红」的标的会让两条曲线打架。
+   */
+  function dailySymbols(st, acc) {
+    var seen = {}, out = [];
+    (st.state.transactions || []).forEach(function (t) {
+      if (acc && acc !== XJ.calc.ALL && t.accountId !== acc) return;
+      if (seen[t.symbol]) return;
+      var rec = st.state.priceHistory && st.state.priceHistory[t.symbol];
+      if (!rec || !rec.points || !rec.points.length) return;
+      seen[t.symbol] = 1;
+      out.push(t.symbol);
+    });
+    return out;
+  }
+
+  /**
    * 「当日」曲线：用分时数据画当天走势。
    * 组合：每个时刻 Σ(当日持股数 × 该时刻价格 × 汇率)，多标的按**时间戳**对齐（calc.alignMinute），
    * 缺失时刻沿用前值，因此不会因某只标的少一个报价点就整段塌陷。
    * 三种指标各取所需：
-   *   收益率   → 相对当日首个报价的百分比（与指数同坐标系，可叠加对比）
+   *   收益率   → **相对昨收**的百分比（与指数同坐标系，可叠加对比）
    *   持仓市值 → 组合市值的绝对值（元）
-   *   净资产   → 持仓总市值 + 累计已收分红 − 累计净投入（元），随市值实时波动
+   *   累计收益 → 持仓总市值 + 累计已收分红 − 累计净投入（元），随市值实时波动
    * @param metric 'ret' | 'mv' | 'nw'
    */
-  function buildIntraday(st, metric) {
+  function buildIntraday(st, metric, retMode) {
     var out = [];
     var acc = st.acc();
     var hs = XJ.calc.holdings(st.state, acc);
+    var mode = retMode === 'cost' ? 'cost' : 'twr';
+
+    /* 与日粒度**同一批「有日线」的标的** —— 当日累计收益 / 成本收益率都要跟它对齐 */
+    var daily = dailySymbols(st, acc);
+    var dailySet = {};
+    daily.forEach(function (s) { dailySet[s] = 1; });
+
+    /* 成本收益率的分母：累计净投入（人民币口径，同集合） */
+    var netCnyCache = null;
+    function netInvestedCny() {
+      if (netCnyCache !== null) return netCnyCache;
+      netCnyCache = 0;
+      hs.forEach(function (h) { if (dailySet[h.symbol]) netCnyCache += U.n0(h.netInvestedCny); });
+      return netCnyCache;
+    }
 
     /* ---- 组合分时：按时间戳对齐后累加 ----
        分时来自 state.minuteCache（落盘、收盘后仍在），只取「最近一个交易日」那批，
        所以收盘后 / 周末也能画出当天走势；陈旧批次由 calc.minuteOf 挡掉。 */
     var syms = hs.map(function (h) { return h.symbol; });
     var minMap = st.intradayFor(syms);
-    var al = XJ.calc.alignMinute(hs, minMap, function (cur) { return fxRate(st, cur); });
+
+    /* ★ 恒用 full 模式：额外拿到「全组合昨收市值 base」与每点的「相对昨收盈亏 pnl」。
+       旧的当日收益率拿「首个时刻的 mv」当分母 —— 那一刻往往只有部分市场在交易
+       （A 股 09:30，美股 21:30），分母偏小会把涨幅放大好几倍。
+       mv 本身的算法没变，市值 / 累计收益两条曲线数值不受影响。 */
+    var al = XJ.calc.alignMinute(hs, minMap, function (cur) { return fxRate(st, cur); },
+      { full: true, prev: prevCloseMap(st, hs) });
     var mvPts = al.points;
 
-    /* 净资产在当日 = 逐分钟组合市值 + 常量项（分红 − 净投入 + 无分时标的的市值）。
+    /* 累计收益在当日 = 逐分钟组合市值 + 常量项（分红 − 净投入 + 无分时标的的市值）。
        常量项走 calc.netWorthAdjust —— 口径与「全部」区间的 marketValueSeries 完全一致，
        别在这里内联手算（曾经内联的版本漏了汇率、又把无分时标的的成本扣了却没算它的市值，
        一个含场外基金的组合能差出好几万）。 */
     var nwAdj = 0;
     if (metric === 'nw') {
-      var usedSyms = syms.filter(function (s) { return al.missing.indexOf(s) < 0; });
-      nwAdj = XJ.calc.netWorthAdjust(st.state, acc, usedSyms);
+      var minuteSyms = syms.filter(function (s) { return al.missing.indexOf(s) < 0; });
+      nwAdj = XJ.calc.netWorthAdjust(st.state, acc, daily, minuteSyms);
     }
 
     if (mvPts.length >= 2) {
       var color = metric === 'nw' ? MK.METRIC_COLORS.nw
         : metric === 'ret' ? MK.METRIC_COLORS.ret : MK.METRIC_COLORS.mv;
-      var name = metric === 'nw' ? '净资产' : metric === 'ret' ? '组合' : '持仓市值';
+      var name = metric === 'nw' ? '累计收益' : metric === 'ret' ? '组合' : '持仓市值';
 
       if (metric === 'ret') {
-        /* 收益率：以当日首个报价为基准。基准必须 > 0 —— 用绝对值当基准时，
-           若开盘就已有持仓成本为负（分红已回本），百分比会算出无意义的大数 */
-        var base = mvPts[0].mv;
-        if (base > 0) {
+        /* 收益率 = 当刻盈亏 ÷ 分母。两个口径共用同一个分子（相对昨收的当日参考盈亏）：
+             twr  → ÷ 全组合昨收市值（= 当日涨跌幅，与同花顺一致）
+             cost → ÷ 累计净投入（每一元本金今天赚了多少）
+           分母必须 > 0，否则算出无意义的大数 */
+        var denom = U.n0(al.base);
+        if (mode === 'cost') denom = netInvestedCny();
+        if (denom > 0) {
+          var isCost = mode === 'cost';
           out.push({
-            key: 'ret', name: name, color: color,
+            key: 'ret', name: isCost ? '成本收益率' : name, color: color,
             points: mvPts.map(function (p) {
-              return { date: p.t, pct: Math.round((p.mv / base - 1) * 10000) / 100 };
+              return { date: p.t, pct: Math.round((U.n0(p.pnl) / denom) * 10000) / 100 };
             }),
           });
         }
@@ -9877,6 +10221,19 @@ XJ.views.networth = (function () {
       }
     }
 
+    /* 当日参考盈亏：末点的「相对昨收」盈亏（金额 + 百分比），供 render 直接读。
+       口径 = Σ 持股数 ×（当刻价 − 昨收）× 汇率，跨币种已折算。 */
+    buildIntraday.todayPnl = (function () {
+      var base = U.n0(al.base);
+      if (mvPts.length < 2 || !(base > 0)) return null;
+      var last = mvPts[mvPts.length - 1];
+      var amt = U.n0(last.pnl);
+      return {
+        at: last.t, base: base, amount: amt,
+        pct: Math.round((amt / base) * 10000) / 100,
+      };
+    })();
+
     /* ---- 指数分时（仅收益率模式叠加，与日粒度口径一致） ---- */
     if (metric === 'ret') {
       var im = st.indexMinute || {};
@@ -9888,12 +10245,14 @@ XJ.views.networth = (function () {
         var raw = m.points.filter(function (p) { return p && p.t && U.num(p.p) !== null; })
           .sort(function (a, b) { return a.t < b.t ? -1 : a.t > b.t ? 1 : 0; });
         if (raw.length < 2) return;
-        var base = U.num(raw[0].p);
-        if (!base) return;
+        /* 指数也按【昨收】做基准（与组合新口径一致，这样跟同花顺的指数涨幅对得上）；
+           取不到昨收时退化为「首个分时价」，保持旧行为。 */
+        var ibase = indexPrevClose(st, key, st.minuteDate()) || U.num(raw[0].p);
+        if (!ibase) return;
         out.push({
           key: key, name: def.name, color: MK.indexColor(key),
           points: raw.map(function (p) {
-            return { date: p.t, pct: Math.round((U.num(p.p) / base - 1) * 10000) / 100 };
+            return { date: p.t, pct: Math.round((U.num(p.p) / ibase - 1) * 10000) / 100 };
           }),
         });
       });
@@ -11906,6 +12265,9 @@ XJ.views.symbol = (function () {
       if (!rec || !rec.points || rec.points.length < 2) {
         return S.ui.historyTriedAt[sym] !== today;      // 今天试过且失败 → 先不重试
       }
+      /* ★ 老缓存只有 400 根（≈1.6 年），必须主动深取一次打上 deep: 2；
+         之后每天只做增量，不再重拉十年。 */
+      if (rec.deep !== 2) return true;
       return rec.at !== today;
     });
     if (!need.length) return Promise.resolve(0);
@@ -11922,16 +12284,48 @@ XJ.views.symbol = (function () {
       if (rec && rec.quoteCode) codes[sym] = rec.quoteCode;
     });
 
-    return XJ.fetcher.fetchPriceHistory(need, { beg: U.addDays(today, -800), end: today, codes: codes }).then(function (map) {
-      var got = 0;
-      Object.keys(map).forEach(function (sym) {
-        if (!map[sym] || map[sym].length < 2) return;
-        /* 只留最近 400 个交易日：再往前的历史对曲线意义不大，
-           但会把 state 撑大（每次改数据都要整份序列化落盘） */
-        var pts = map[sym].length > 400 ? map[sym].slice(-400) : map[sym];
-        S.state.priceHistory[sym] = { at: today, points: pts };
-        got++;
-      });
+    /* 首次 / 老缓存升级：深取一次（≈10 年，分两窗拼接）；
+       之后每天只增量拉最近 800 天再与旧点合并 —— 长历史只付一次代价。 */
+    var deep = need.filter(function (sym) {
+      var rec = S.state.priceHistory[sym];
+      return !rec || rec.deep !== 2;
+    });
+    var shallow = need.filter(function (sym) { return deep.indexOf(sym) < 0; });
+
+    function finishDeep() {
+      if (!deep.length) return Promise.resolve(0);
+      return XJ.fetcher.fetchLongCloseSeries(deep, { codes: codes, today: today }).then(function (map) {
+        var n = 0;
+        Object.keys(map).forEach(function (sym) {
+          if (!map[sym] || map[sym].length < 2) return;
+          S.state.priceHistory[sym] = { at: today, deep: 2, points: map[sym] };
+          n++;
+        });
+        return n;
+      }).catch(function () { return 0; });
+    }
+
+    function finishShallow() {
+      if (!shallow.length) return Promise.resolve(0);
+      return XJ.fetcher.fetchPriceHistory(shallow, { beg: U.addDays(today, -800), end: today, codes: codes })
+        .then(function (map) {
+          var n = 0;
+          Object.keys(map).forEach(function (sym) {
+            var fresh = map[sym];
+            if (!fresh || fresh.length < 2) return;
+            var old = (S.state.priceHistory[sym] && S.state.priceHistory[sym].points) || [];
+            /* 合并：只保留「比新数据第一天更早」的旧点，避免重复与覆盖 */
+            var cut = fresh[0][0];
+            var keep = old.filter(function (p) { return p[0] < cut; });
+            S.state.priceHistory[sym] = { at: today, deep: 2, points: keep.concat(fresh) };
+            n++;
+          });
+          return n;
+        }).catch(function () { return 0; });
+    }
+
+    return finishDeep().then(finishShallow).then(function (a) {
+      var got = a;
       historyBusy = false;
       S.ui.historyBusy = false;
       S.commitNow(null);
@@ -13867,6 +14261,11 @@ XJ.views.symbol = (function () {
 
   UI.on('setNwMode', function (node) {
     S.setUI(nwPatch(nwNs(node), { mode: node.getAttribute('data-v') === 'candle' ? 'candle' : 'line' }));
+  });
+
+  /* 收益率口径：时间加权（TWR）/ 成本收益率。只影响收益率模式的取数与文案 */
+  UI.on('setNwRetMode', function (node) {
+    S.setUI(nwPatch(nwNs(node), { retMode: node.getAttribute('data-v') === 'cost' ? 'cost' : 'twr' }));
   });
 
   /** 勾选 / 取消对比指数 */
