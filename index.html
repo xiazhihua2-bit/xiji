@@ -2530,7 +2530,7 @@ XJ.model = (function () {
     return {
       deviceId: null, enabled: false, token: null, gistId: null,
       version: 0, etag: null, lastOkAt: null, failSince: null, lastErr: null,
-      everPaired: false, outbox: [], versions: {}, tombstones: {},
+      everPaired: false, installMode: null, outbox: [], versions: {}, tombstones: {},
     };
   }
 
@@ -3424,6 +3424,9 @@ XJ.syncCore = (function () {
     deviceId: null, enabled: false, token: null, gistId: null,
     version: 0, etag: null, lastOkAt: null,
     failSince: null, lastErr: null, everPaired: false,
+    /* 由安装链接写入的「这台设备首次接入时用哪种方式对齐」，见 firstSyncMode。
+       首轮同步成功后由 sync.js 清空，之后一律走 merge。 */
+    installMode: null,
     outbox: [], versions: {}, tombstones: {},
   };
 
@@ -3435,6 +3438,10 @@ XJ.syncCore = (function () {
     if (!m.tombstones || typeof m.tombstones !== 'object') m.tombstones = {};
     if (m.enabled !== true) m.enabled = false;
     if (m.everPaired !== true) m.everPaired = false;
+    /* installMode 归一化：只认 'merge' / 'overwrite'，其余一律回到 null。
+       ★ 这样 meta() 返回的对象始终有个确定的 installMode，
+         不会让「老版本导入的 state」留下一个 undefined 的模糊状态。 */
+    if (m.installMode !== 'merge' && m.installMode !== 'overwrite') m.installMode = null;
     if (m.version === undefined || m.version === null) m.version = 0;
     if (!m.deviceId) m.deviceId = U.uid('dev');
     return m;
@@ -3922,6 +3929,9 @@ XJ.syncCore = (function () {
     res.mode = useOverwrite ? 'overwrite' : 'merge';
     m.version = U.n0(remote && remote.version);
     m.everPaired = true;
+    /* ★ 安装链接锚定的首次对齐方式【只用一次】：已经按它对齐并配对成功，立刻清掉。
+       否则以后每次换 Gist / 重连都会重演一次覆盖，那是不可逆的伤害。 */
+    m.installMode = null;
     /* 远端 snapshot 里还有没被 op 覆盖到的戳，一并登记，避免回声 */
     adoptVersions(state, remote);
     return res;
@@ -3969,16 +3979,118 @@ XJ.syncCore = (function () {
   /* ---------------- 首次接入的安全判定（见计划 §4） ---------------- */
 
   /**
+   *   · 安装链接已锚定（installMode = 'merge' | 'overwrite'）→ 用用户选的那个
    *   · 从未配对过，且本机是空白（无交易、无到账） → 'overwrite'（无摩擦）
    *   · 从未配对过，但本机已有自己的记账数据       → 'ask'（界面弹窗让用户选）
    *   · 曾配对过（换设备/重装后重连）              → 'merge'（绝不覆盖）
+   *
+   *  ★ 为什么要有 installMode 这一层：sync.js 的自动路径过去把 'ask' 一律降级成
+   *    merge，于是「在已有数据的设备上点安装链接」会静默合并 —— 而合并是不可逆的。
+   *    现在界面必须先问清楚，把答案锚在 syncMeta 里，核心层照它执行。
    */
   function firstSyncMode(state) {
     var m = meta(state);
+    if (m.installMode === 'merge' || m.installMode === 'overwrite') return m.installMode;
     if (m.everPaired) return 'merge';
     var hasData = (state.transactions && state.transactions.length > 0) ||
       (state.received && state.received.length > 0);
     return hasData ? 'ask' : 'overwrite';
+  }
+
+  /* ---------------- 安装链接（一劳永逸的配对捷径） ---------------- */
+
+  /**
+   *  一次配对，三台设备各点一次，之后永远不再配置。
+   *
+   *  链接形如  https://<站点>/#xjsync=XJ1p.<base64url>
+   *  载荷      { v:1, t:令牌, g:GistID }
+   *
+   *  ★ 这是【唯一】一条把令牌带出本机的路径，因此规则写死在这里：
+   *    · 只带 v / t / g 三样，绝不含 deviceId、versions、outbox、etag —— 那些是本机状态
+   *    · 编码复用 transfer 的 base64url（UTF-8 → 字节 → base64url，无填充），
+   *      目的是缩短链接长度，并让链接被误贴到网页时不会触发明文匹配。
+   *      ★ 这不是安全措施：链接本身就是钥匙，拿到链接 = 拿到读写云端的权限。
+   *    · 任何一处不合法一律返回 null，绝不抛错、绝不「尽力猜」
+   */
+
+  var INSTALL_KEY = '#xjsync=';
+  /* 只认明文编码（XJ1p.）。XJ1g. 是 gzip 变体，链接太长没意义，直接拒绝。 */
+  var INSTALL_PREFIX = 'XJ1p.';
+  var INSTALL_MAX = 1200;                       // 链接里那一小段的长度上限
+  var GIST_ID_RE = /^[0-9a-f]{16,40}$/i;
+
+  /** base64url 编码器：优先用 transfer 借来的字节/base64 工具（避免在两层里各写一份） */
+  function b64urlOf(str) {
+    var T = XJ.transfer || {};
+    if (typeof T.b64url === 'function' && typeof T.utf8Bytes === 'function') {
+      return T.b64url(T.utf8Bytes(str));
+    }
+    /* transfer 不在场时的兜底：只支持 ASCII（令牌与 Gist ID 都是 ASCII） */
+    try { return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+    catch (e) { return null; }
+  }
+
+  /** base64url 解码器：返回字符串或 null（绝不抛错） */
+  function unb64urlOf(s) {
+    var T = XJ.transfer || {};
+    if (typeof T.unb64url === 'function' && typeof T.bytesUtf8 === 'function') {
+      try {
+        var bytes = T.unb64url(s);
+        if (!bytes || !bytes.length) return null;
+        return T.bytesUtf8(bytes);
+      } catch (e) { return null; }
+    }
+    try { return atob(String(s).replace(/-/g, '+').replace(/_/g, '/')); } catch (e) { return null; }
+  }
+
+  /** 配对信息 → 安装链接载荷（同步纯函数，verify 沙箱可复算） */
+  function encodeInstall(cfg) {
+    var c = cfg || {};
+    var token = String(c.token === undefined || c.token === null ? '' : c.token).trim();
+    var gistId = String(c.gistId === undefined || c.gistId === null ? '' : c.gistId).trim();
+    if (!token || token.length > 300) return null;
+    if (!GIST_ID_RE.test(gistId)) return null;
+    var enc = INSTALL_PREFIX + b64urlOf(JSON.stringify({ v: 1, t: token, g: gistId }));
+    if (!enc || enc.length > INSTALL_MAX) return null;
+    return enc;
+  }
+
+  /** 安装链接载荷 → 配对信息。任何不合法都返回 null。 */
+  function decodeInstall(str) {
+    var s = String(str === undefined || str === null ? '' : str).trim();
+    if (!s || s.length > INSTALL_MAX) return null;
+    if (s.indexOf(INSTALL_PREFIX) !== 0) return null;
+    var body = unb64urlOf(s.slice(INSTALL_PREFIX.length));
+    if (!body) return null;
+    var o = null;
+    try { o = JSON.parse(body); } catch (e) { return null; }
+    if (!o || typeof o !== 'object') return null;
+    if (o.v !== 1) return null;                 // 格式版本不认识就明确拒绝
+    /* 复用编码侧的校验，保证「能解出来的必能重新编回去」 */
+    if (!encodeInstall({ token: o.t, gistId: o.g })) return null;
+    return { token: String(o.t).trim(), gistId: String(o.g).trim() };
+  }
+
+  /** 从 location.hash 取出安装载荷（没有则返回 null） */
+  function readInstallHash(hash) {
+    var h = String(hash === undefined || hash === null ? '' : hash);
+    var i = h.indexOf(INSTALL_KEY);
+    if (i < 0) return null;
+    return decodeInstall(h.slice(i + INSTALL_KEY.length));
+  }
+
+  /** 清掉地址栏里的安装载荷，避免刷新时反复执行 */
+  function clearInstallHash(hash) {
+    var h = String(hash === undefined || hash === null ? '' : hash);
+    var i = h.indexOf(INSTALL_KEY);
+    return i < 0 ? h : h.slice(0, i);
+  }
+
+  /** 用站点基址拼出完整安装链接；base 里的 # 会被去掉（照 transfer 的规矩） */
+  function buildInstallUrl(base, cfg) {
+    var enc = encodeInstall(cfg);
+    if (!enc) return null;
+    return String(base || '').split('#')[0] + INSTALL_KEY + enc;
   }
 
   /* ---------------- 状态自述（给界面用） ---------------- */
@@ -4027,6 +4139,13 @@ XJ.syncCore = (function () {
     adoptVersions: adoptVersions,
     mergeRemote: mergeRemote,
     firstSyncMode: firstSyncMode,
+    INSTALL_KEY: INSTALL_KEY,
+    INSTALL_PREFIX: INSTALL_PREFIX,
+    encodeInstall: encodeInstall,
+    decodeInstall: decodeInstall,
+    readInstallHash: readInstallHash,
+    clearInstallHash: clearInstallHash,
+    buildInstallUrl: buildInstallUrl,
     gcTombstones: gcTombstones,
     status: status,
     nowMs: nowMs,
@@ -4142,15 +4261,23 @@ XJ.sync = (function () {
   function createMemoryTransport(opts) {
     opts = opts || {};
     var store = {};
+    /* 只有 setAccepted() 指定过的令牌才算有效；默认「来者不拒」，
+       这样才能让 401 分支被真实地测到（见 tools/test-syncnet.mjs 的假服务端）。 */
+    var accepted = null;
     function key(id) { return id || 'default'; }
+    function authOk(cfg) { return accepted === null || (cfg && cfg.token === accepted); }
     return {
       name: 'memory',
       /* 直接读写内部数据，供测试构造「另一个设备」看到的远端 */
       _dump: function (id) { return store[key(id)] ? JSON.parse(store[key(id)]) : null; },
       _load: function (id, obj) { store[key(id)] = JSON.stringify(obj); },
+      /* 声明「哪个令牌才是有效的」。★ 不声明则任何令牌都通过 ——
+         既有用例依赖这个宽松默认值；需要测 401 / 安装链接预检的用例显式声明。 */
+      _accept: function (token) { accepted = token; },
       _requests: 0,
       pull: function (cfg) {
         this._requests++;
+        if (!authOk(cfg)) return Promise.resolve({ status: 401 });
         var raw = store[key(cfg.gistId)];
         if (!raw) return Promise.resolve({ status: 404 });
         var obj = JSON.parse(raw);
@@ -4160,6 +4287,7 @@ XJ.sync = (function () {
       },
       push: function (cfg) {
         this._requests++;
+        if (!authOk(cfg)) return Promise.resolve({ status: 401 });
         var k = key(cfg.gistId);
         var raw = store[k];
         var obj = JSON.parse(JSON.stringify(cfg.data));
@@ -4167,12 +4295,14 @@ XJ.sync = (function () {
         return Promise.resolve({ status: 200, etag: 'W/"mem-' + (obj.version || 0) + '"' });
       },
       /* 账户与 Gist 发现接口（内存实现只提供最小可用集） */
-      whoami: function () {
+      whoami: function (cfg) {
         this._requests++;
+        if (!authOk(cfg)) return Promise.resolve({ status: 401 });
         return Promise.resolve({ status: 200, data: { login: 'memory-user' }, scopes: 'gist' });
       },
-      listGists: function () {
+      listGists: function (cfg) {
         this._requests++;
+        if (!authOk(cfg)) return Promise.resolve({ status: 401 });
         var out = [];
         Object.keys(store).forEach(function (k) {
           out.push({ id: k, description: GIST_DESC, files: buildFiles({}) });
@@ -4181,6 +4311,7 @@ XJ.sync = (function () {
       },
       createGist: function (cfg) {
         this._requests++;
+        if (!authOk(cfg)) return Promise.resolve({ status: 401 });
         var id = 'mem_' + Date.now().toString(36);
         store[id] = JSON.stringify(cfg.data);
         return Promise.resolve({ status: 201, data: { id: id } });
@@ -16684,8 +16815,8 @@ XJ.views.symbol = (function () {
     if (!st) return '同步模块未加载';
     if (syncBusy) return '正在同步…';
     if (st.lastErr) return st.lastErr.msg || '上次同步失败';
-    if (!st.lastOkAt) return '尚未同步过';
-    return '上次同步 ' + String(st.lastOkAt).slice(0, 16).replace('T', ' ');
+    if (!st.lastOkAt) return st.paired ? '已连接，等待首次同步…' : '尚未配对';
+    return '已连接 · 上次同步 ' + String(st.lastOkAt).slice(0, 16).replace('T', ' ');
   }
 
   function syncBodyHtml() {
@@ -16741,6 +16872,22 @@ XJ.views.symbol = (function () {
             ? '<br>云端那份数据不在了。可以点「新建同步位置」重新开始。'
             : '<br>这不会影响本机数据，联网后会自动继续。') +
         '</div>';
+    }
+
+    /* 安装链接：配对完成之后才谈得上，一条链接 = 其它设备点一次就配好 */
+    if (sm.token && sm.gistId) {
+      html += '<div class="card" style="box-shadow:none;background:var(--card-2);margin-bottom:14px;padding:12px 14px">' +
+        '<div class="tiny" style="line-height:1.8">' +
+        '<b>在其它设备上「一次点开就配好」</b><br>' +
+        '生成一条安装链接，发到你的手机 / 平板 / 电脑上各点开一次：' +
+        '它会自动填入令牌、自动选中这份云端数据、并立刻拉齐。之后那台设备' +
+        '<strong>每次打开都自动同步，不用再登录、不用再配置</strong>。' +
+        '</div></div>' +
+        '<button class="btn-block" data-act="syncInstallLink">生成安装链接</button>';
+    } else if (!sm.gistId) {
+      html += '<div class="tiny" style="margin-bottom:14px;line-height:1.7">' +
+        '完成下面两步（填入令牌 → 选中云端位置）后，就能生成一条安装链接，' +
+        '让其它设备点开一次即可自动同步。</div>';
     }
 
     /* 令牌 */
@@ -16914,6 +17061,164 @@ XJ.views.symbol = (function () {
     UI.toast('已关闭同步，本机数据与云端数据都保留');
   });
 
+  /* ---------------- 安装链接 ---------------- */
+
+  /** 站点基址（含子目录），去掉 # 之后的所有东西 */
+  function installBase() {
+    try { return String(location.href).split('#')[0]; } catch (e) { return ''; }
+  }
+
+  /** 生成安装链接并复制到剪贴板 */
+  function copyInstallLink() {
+    var m = S.state.syncMeta || {};
+    var url = XJ.syncCore.buildInstallUrl(installBase(), { token: m.token, gistId: m.gistId });
+    if (!url) { UI.toast('还缺令牌或云端位置，无法生成'); return; }
+    copyText(url);
+  }
+
+  UI.on('syncInstallLink', function () {
+    var m = S.state.syncMeta || {};
+    if (!m.token || !m.gistId) return UI.toast('请先填入令牌并选中云端位置');
+    /* ★ 生成前必须把风险说清楚：这条链接就是钥匙，拿到它就能读写云端数据 */
+    UI.confirm({
+      title: '生成安装链接',
+      html: '这条链接里<strong>包含你的同步钥匙</strong>（也就是那个 GitHub 令牌）。<br><br>' +
+        '任何人拿到这条链接，都能读写你这份云端数据。<b>请不要把它发到群里、' +
+        '不要贴进公开网页</b>。建议发到「文件传输助手」或自己的邮箱，只给自己的设备点开。<br><br>' +
+        '链接只对这台设备以外的其它设备有意义 —— 本机已经配好了。',
+      confirmText: '我知道，生成',
+    }).then(function (ok) {
+      if (ok) copyInstallLink();
+    });
+  });
+
+  /* 安装链接的首次对齐方式：这里问，答案锚进 syncMeta.installMode，
+     由 sync-core 的 firstSyncMode() 执行。★ 默认是「合并」，绝不默认覆盖。 */
+  var pendingInstall = null;
+
+  function askInstallMode(payload, base) {
+    return new Promise(function (resolve) {
+      pendingInstall = { payload: payload, base: base, resolve: resolve };
+      UI.openSheet({
+        title: '这台设备已有自己的记录',
+        html:
+          '<div class="tiny" style="line-height:1.75;margin-bottom:14px">' +
+          '本机已经有记账数据，云端也有一份。<b>要怎么办？</b><br><br>' +
+          '· <b>合并</b>：两边记录按条融合，谁都不会丢（推荐）<br>' +
+          '· <b>替换</b>：丢掉本机这份，完全以云端为准' +
+          '</div>' +
+          '<button class="btn-block" data-act="installPickMerge">合并（保留双方全部记录）</button>' +
+          '<button class="btn-block ghost" data-act="installPickReplace">用云端替换本机</button>' +
+          '<button class="btn-block ghost" data-act="installPickCancel">取消</button>',
+      });
+    });
+  }
+
+  UI.on('installPickMerge', function () { finishInstallPick('merge'); });
+  UI.on('installPickReplace', function () { finishInstallPick('overwrite'); });
+  UI.on('installPickCancel', function () { finishInstallPick(null); });
+
+  function finishInstallPick(mode) {
+    var p = pendingInstall;
+    pendingInstall = null;
+    UI.closeSheet();
+    if (!p) return;
+    p.resolve(mode);
+  }
+
+  /** 落地安装链接：写令牌与位置 → 登记既有数据 → 开同步 → 标记首屏要先对齐 */
+  function applyInstallLink(payload, mode) {
+    S.commit(function (s) {
+      var m = XJ.syncCore.meta(s);
+      m.token = payload.token;
+      m.gistId = payload.gistId;
+      m.etag = null;                 // 换位置必须重新全量拉一次
+      m.enabled = true;
+      m.installMode = mode;          // 只生效一次，mergeRemote 用完就清
+      /* 登记本机既有数据：只登记不产生 op，否则会把整份历史当成「本机新增」推上去 */
+      XJ.syncCore.seedVersions(s);
+      try { C.applyAutoReceived(s); } catch (e) { /* 忽略 */ }
+    });
+    XJ.sync.start();
+    /* 立刻拉一次，让用户马上看到云端数据（首屏那一次也会等它） */
+    XJ.sync.tick({ silent: true });
+  }
+
+  /**
+   * 落地前先跟 GitHub 核对一次（在弹层背后进行，不打断用户）。
+   * ★ 为什么值得多这一次请求：链接可能被聊天软件截断、被换行拆开、被转发时改坏。
+   *   如果直接「当作配好了」保存下来，此后每一轮都会 401，用户只会看到
+   *   「令牌已失效」却完全不知道为什么 —— 那比当场告诉他「链接不完整」糟得多。
+   *   这里只做校验，绝不写任何状态；通过之后才允许 applyInstallLink 落盘。
+   */
+  function preflightInstall(payload) {
+    return Promise.race([
+      XJ.sync.checkToken(payload.token)
+        .then(function (r) {
+          if (!r.ok) return { ok: false, msg: r.msg || '令牌无效' };
+          if (!r.hasGist) return { ok: false, msg: r.msg || '这个令牌没有 gist 权限' };
+          return XJ.sync.listSyncGists(payload.token).then(function (ls) {
+            var items = (ls && ls.items) || [];
+            var hit = items.filter(function (g) { return g.id === payload.gistId; })[0];
+            if (hit) return { ok: true };
+            /* 令牌有效但清单里没有这个位置：可能是它在别的账号下，也可能已删。
+               仍然放行 —— 由同步本身去给出准确的 404 文案，比这里瞎猜好。 */
+            return { ok: true, warn: '链接里的云端位置不在这个令牌的可见范围（可能已被删除）' };
+          });
+        })
+        .catch(function (e) {
+          return { ok: false, msg: '连不上 GitHub：' + ((e && e.message) || '网络不可用') };
+        }),
+      new Promise(function (r) {
+        setTimeout(function () {
+          r({ ok: false, msg: '连 GitHub 超时 —— 国内网络下 api.github.com 有时不通，换个网络再点一次这条链接' });
+        }, 15000);
+      }),
+    ]);
+  }
+
+  /** 走到「该落盘」这一步：先核对，再落地 */
+  function commitInstall(payload, mode) {
+    preflightInstall(payload).then(function (chk) {
+      if (!chk.ok) {
+        UI.toast('安装链接没能生效：' + chk.msg + '。可以改用「粘贴令牌」的方式手动接入。', 6000);
+        return;
+      }
+      applyInstallLink(payload, mode);
+      UI.toast('安装链接已生效，正在拉取云端数据…', 3000);
+    });
+  }
+
+  /** 启动时处理 #xjsync=：这是「一劳永逸」的全部实现 */
+  function checkInstallHash() {
+    var payload = null;
+    try { payload = XJ.syncCore.readInstallHash(location.hash); } catch (e) { /* 忽略 */ }
+    if (!payload) return;
+    /* ★ 立刻清掉地址栏里的载荷：否则每次刷新都会重放一次安装动作 */
+    var base = installBase();
+    try { history.replaceState(null, '', base + location.search); } catch (e) { /* 忽略 */ }
+    if (!syncAvailable()) {
+      UI.toast('这条安装链接需要在已部署的网址上打开（file:// 无法同步）', 4000);
+      return;
+    }
+    var s = S.state;
+    var hasLocal = (s.transactions && s.transactions.length > 0) ||
+      (s.received && s.received.length > 0);
+    if (hasLocal) {
+      /* 本机有数据 → 先问清楚要合并还是替换，拿到答案再核对、再落地 */
+      askInstallMode(payload, base).then(function (mode) {
+        if (!mode) { UI.toast('已取消，没有改动本机任何数据'); return; }
+        commitInstall(payload, mode);
+        UI.toast(mode === 'overwrite' ? '正在核对链接，随后用云端数据替换本机…'
+          : '正在核对链接，随后把两边记录合并…', 3000);
+      });
+      return;
+    }
+    /* 本机空白 → 无摩擦直接接入 */
+    commitInstall(payload, 'overwrite');
+    UI.toast('正在核对安装链接并拉取云端数据…', 3000);
+  }
+
   UI.on('xferSnapshots', function (node) { XFER_SNAPSHOTS = !!node.checked; });
   UI.on('xferLink', function () {
     XJ.transfer.encode(transferPayload()).then(function (enc) { showTransferOut(enc, true); });
@@ -17025,6 +17330,15 @@ XJ.views.symbol = (function () {
       if (XJ.sync && XJ.sync.flushNow) XJ.sync.flushNow();
     });
 
+    /* ★ 只改 hash 的跳转【不会重新加载页面】：浏览器把它当同文档导航，
+       只改地址栏、不跑脚本。所以「应用已经开着，此时又点了一条安装链接」
+       必须靠 hashchange 兜住 —— 否则用户会觉得链接点了没反应。
+       （如果链接里同时带 query，那会是真导航，这时这里不会被触发也别担心。） */
+    window.addEventListener('hashchange', function () {
+      if (!S.state) return;                 // 启动还没走完，boot 里那次会处理
+      try { checkInstallHash(); } catch (e) { /* 忽略 */ }
+    });
+
     XJ.storage.init().then(function (mode) {
       return XJ.storage.load();
     }).then(function (loaded) {
@@ -17052,6 +17366,13 @@ XJ.views.symbol = (function () {
       S.subscribe(render);
       injectManifest();
       registerSW();
+
+      /* ---- 安装链接（#xjsync=）优先处理 ----
+         必须排在下面算 firstPaint 之前：那一刻它判断的是「同步是否已开启」，
+         而链接打开的设备此刻还没开。先落地链接，首屏对齐就会带上「等云端最多 4 秒」，
+         否则用户会先看到空数据、再跳变一次。
+         如果本机已有记录，这里会弹层问「合并还是替换」—— 答案回来才落地。 */
+      checkInstallHash();
 
       /* ---- 跨设备同步：首屏对齐 ----
          已开启同步且配对过时，**先把云端对齐再画第一帧**，
