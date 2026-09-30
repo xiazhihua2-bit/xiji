@@ -2069,12 +2069,14 @@ XJ.market = (function () {
 XJ.model = (function () {
   var U = XJ.util;
 
-  var DATA_VERSION = 4;
+  var DATA_VERSION = 5;
 
   /**
    * v4：默认成本口径改成「分红摊薄」——分红到账后自动降低持仓成本。
    * 老数据（version < 4）在 ensureBootstrapped 里一次性迁移过去；
    * 迁移只跑一次，之后用户手动改过的口径不会被覆盖。
+   * v5：新增 syncMeta（跨设备同步的连接信息与修订账本）。**只补容器、不动数据**，
+   *     同步默认关闭，不开就等于没这回事。
    */
   var DEFAULT_COST_METHOD = 'dividendDiluted';
 
@@ -2263,6 +2265,24 @@ XJ.model = (function () {
       /* 余额宝七日年化（全局一份，不是 per-symbol）：
          { at:'YYYY-MM-DD', points:[['YYYY-MM-DD', pct]] }，按周降采样（约 520 点覆盖 10 年） */
       benchHistory: null,
+      /* 跨设备同步的元数据（v5 新增）。默认【关闭】：除非 syncMeta.enabled === true，
+         应用不会发出任何同步请求。deviceId / versions / tombstones 由 sync-core 维护，
+         这里只保证容器存在。token 与 gistId 绝不进任何导出（见 toExport）。 */
+      syncMeta: {
+        deviceId: null,
+        enabled: false,
+        token: null,
+        gistId: null,
+        version: 0,
+        etag: null,
+        lastOkAt: null,
+        failSince: null,
+        lastErr: null,
+        everPaired: false,
+        outbox: [],
+        versions: {},
+        tombstones: {},
+      },
     };
   }
 
@@ -2391,6 +2411,19 @@ XJ.model = (function () {
       state.benchHistory = bhPts.length >= 2 ? { at: state.benchHistory.at || null, points: bhPts } : null;
     }
 
+    /* ---- v5 新增容器：跨设备同步元数据 ----
+       只补容器、不动数据。同步默认关闭；没开开关就只是多一个空对象。
+       ★ 这里绝不从「导入的 JSON」里读 syncMeta —— 换设备导入别人的备份时
+         不该把对方的同步连接信息带进来（token 会被误用）。 */
+    if (!state.syncMeta || typeof state.syncMeta !== 'object') state.syncMeta = {};
+    var sm = state.syncMeta;
+    if (sm.enabled !== true) sm.enabled = false;
+    if (sm.everPaired !== true) sm.everPaired = false;
+    if (!Array.isArray(sm.outbox)) sm.outbox = [];
+    if (!sm.versions || typeof sm.versions !== 'object') sm.versions = {};
+    if (!sm.tombstones || typeof sm.tombstones !== 'object') sm.tombstones = {};
+    if (sm.version === undefined || sm.version === null) sm.version = 0;
+
     /* ---- v3 → v4 迁移：默认成本口径改为「分红摊薄」 ----
        分红到账后自动降低持仓成本。只在版本号更旧时跑一次，
        之后用户手动改过的口径不会被再次覆盖。 */
@@ -2489,6 +2522,18 @@ XJ.model = (function () {
   }
 
   /* ---- 序列化 ---- */
+  /** 一个「干净的」syncMeta：导出与搬运共用。
+   *  ★ token（= 同步钥匙）与 gistId（= 数据位置）绝不上路 —— 备份文件会被转发/上传；
+   *  ★ deviceId / versions / tombstones / outbox / etag 是本机状态，导出无意义且会互相污染；
+   *  ★ enabled 一律置回关闭：换台设备导入别人的备份不该自动开始外发请求。 */
+  function emptySyncMeta() {
+    return {
+      deviceId: null, enabled: false, token: null, gistId: null,
+      version: 0, etag: null, lastOkAt: null, failSince: null, lastErr: null,
+      everPaired: false, outbox: [], versions: {}, tombstones: {},
+    };
+  }
+
   function toExport(state, note) {
     return {
       app: '息记复刻版',
@@ -2523,6 +2568,8 @@ XJ.model = (function () {
       benchHistory: state.benchHistory,
       /* minuteCache 不进导出 JSON：它是「当天分时」这种当天有效的运行时缓存，
          换台设备 / 隔几天再用都没意义，导出只会白白撑大备份文件。 */
+      /* 同步元数据：只带一个空壳占位，绝不含 token / gistId / deviceId / 修订账本 */
+      syncMeta: emptySyncMeta(),
     };
   }
 
@@ -2547,6 +2594,8 @@ XJ.model = (function () {
     if (raw.yieldHistory && typeof raw.yieldHistory === 'object') out.yieldHistory = raw.yieldHistory;
     if (raw.benchHistory && typeof raw.benchHistory === 'object') out.benchHistory = raw.benchHistory;
     /* minuteCache 刻意不在白名单内：导入后为 null，下次刷新行情时自动重建当天分时 */
+    /* syncMeta 也刻意不在白名单内：导入的备份不带同步连接信息，
+       out.syncMeta 保持 defaultState() 里的初始值（关闭 + 无 token）。 */
     if (raw.version) out.version = raw.version;
 
     return ensureBootstrapped(out);
@@ -2625,6 +2674,7 @@ XJ.model = (function () {
     validateTransaction: validateTransaction,
     validateAccount: validateAccount,
     toExport: toExport, fromImport: fromImport,
+    emptySyncMeta: emptySyncMeta,
     normCloseSeries: normCloseSeries,
     transactionsCsv: transactionsCsv, receivedCsv: receivedCsv,
   };
@@ -2646,6 +2696,16 @@ XJ.storage = (function () {
   var db = null;
   var saveTimer = null;
   var lastError = null;
+
+  /* 落盘前的钩子槽。同步层（src/sync.js）会把它挂上，用来在「与 state 同一次写入」里
+     把本轮变更算成增量 op —— 单文档整份写入天然原子，所以 op 与数据不可能写一半。
+     ★ storage 本身【不认识】sync，方向始终是 sync → storage，不会成环。
+     钩子必须同步且不能抛：任何异常都不该阻断本地保存。 */
+  var onBeforeSave = null;
+  function runHook(state) {
+    if (typeof onBeforeSave !== 'function') return;
+    try { onBeforeSave(state); } catch (e) { console.error('[sync] beforeSave', e); }
+  }
 
   function openIdb() {
     return new Promise(function (resolve) {
@@ -2764,6 +2824,7 @@ XJ.storage = (function () {
   }
 
   function save(state) {
+    runHook(state);
     if (mode === 'idb') {
       return idbPut(state).catch(function (e) {
         lastError = e;
@@ -2804,6 +2865,8 @@ XJ.storage = (function () {
     save: save,
     saveSoon: saveSoon,
     clear: clear,
+    /** 注册「落盘前」钩子（同步层用）。传 null 可摘除。 */
+    setOnBeforeSave: function (fn) { onBeforeSave = typeof fn === 'function' ? fn : null; },
     getMode: function () { return mode; },
     getLastError: function () { return lastError; },
     modeLabel: function () { return mode === 'idb' ? 'IndexedDB' : mode === 'ls' ? '浏览器本地存储' : '不可用'; },
@@ -3126,6 +3189,1428 @@ XJ.transfer = (function () {
     encode: encode, decode: decode,
     buildImportUrl: buildImportUrl, readImportHash: readImportHash, clearImportHash: clearImportHash,
     summarize: summarize, mergeInto: mergeInto, overwriteWith: overwriteWith,
+  };
+})();
+
+
+/* ==================== src/sync-core.js ==================== */
+/* ==================== 跨设备同步 · 纯逻辑内核 ====================
+ * 这一层【只有纯函数】：不碰 DOM、不碰网络、不碰 storage。
+ * 因此 verify.mjs 能把它丢进 Node 沙箱独立复算 —— 与 calc.js 同一套待遇。
+ * 网络与编排在 src/sync.js（一层薄壳），存储钩子在 src/storage.js（只是一个钩子槽）。
+ *
+ * 设计要点（与 docs/跨设备同步-方案评估与设计.md 一致）：
+ *   · 真源只有 transactions / received / accounts / expenses / symbols / settings
+ *     / projection / snapshots。持仓、成本、息率全是 calc 派生的
+ *     → 同步底层事实即可，派生值自动收敛，不存在「持仓表双写冲突」。
+ *   · 每条记录带一个【修订戳】{ rev, rt, rd }：
+ *       rev = 修订号（每次内容变化 +1）  rt = 修订时刻（毫秒）  rd = 设备号
+ *     比较顺序 rev → rt → rd。★ rd 兜底是必须的：三台设备的手动时钟可能不一致，
+ *     只靠时间戳会出现「后改的被先改的覆盖」；有了 rd 做最终仲裁，
+ *     任意两端对同一条冲突都能得出【同一个结论】（收敛性）。
+ *   · 删除写【墓碑】：硬删除在另一端会「复活」，墓碑则永远压过新增。
+ *   · syncMeta.versions 是「我们知道的所有记录」的账本，每条记两样东西：
+ *       h = 上次见到的内容指纹（用来判「这条被改过没有」，避免给 36 处 commit 逐个加参数）
+ *       q = 是否「在本机见过实体」（=1）。用来区分两种「本地没有」：
+ *             有 q 却没实体  → 本机把它删了     → 发墓碑
+ *             无 q 且无实体  → 本机从来没有这条 → 只登记，绝不当删除（否则会误删别的设备的数据）
+ *   · 新设备首次拉取后必须把远端戳【全部登记】进 versions（adoptVersions），
+ *     否则下一步 diff 会认为「这些我一条没看过」而把整份数据反向推回去，形成回声。
+ *
+ * ★ 两条踩过的坑（别再犯）：
+ *   ① 内容指纹必须排除同步自己的 rev/rt/rd，否则「盖上戳」本身会被当成内容变化，
+ *      每次落盘都多出一条无意义的 op。
+ *   ② 「本机新产生的记录」必须产出 op —— 否则「手机加仓」永远推不到平板。
+ *      与「首次纳入既有数据」的区分只能靠调用方：attach() 走 seedVersions() 只登记，
+ *      平时的落盘走 diffToOps() 凡未登记的一律当作新增。
+ */
+
+XJ.syncCore = (function () {
+  var U = XJ.util;
+
+  /* 同步文件里 ops 最多留这么多条；超了就让 sync.js 折叠（重建 snapshot） */
+  var OPS_CAP = 200;
+  /* 墓碑上限：只增不减会一直占体积，超过就按最老的裁 */
+  var TOMB_CAP = 2000;
+
+  /* 同步的 settings 白名单。刻意【不含】ocr（含 API Key）、
+     lastQuoteAt / lastPlanAt / quoteRefreshMs / fx（本机口径）、
+     payoutPopupAt / heroCollapsed（「这台设备弹过/收起过没」，同步只会添乱）。 */
+  var SETTINGS_SYNC = [
+    'defaultAccountId', 'reminderLeadDays', 'heroMetrics', 'heroForecast',
+    'defaultDividendBasis', 'showLogo', 'unsupportedDividend', 'indexCompare',
+    'showYieldBench', 'dividendFun', 'onboarded',
+  ];
+
+  /* ---------------- 通用小工具 ---------------- */
+
+  function clone(v) { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
+
+  function toMs(stamp, fallback) {
+    if (typeof stamp === 'number' && isFinite(stamp)) return stamp;
+    var t = Date.parse(String(stamp || ''));
+    return isFinite(t) ? t : fallback;
+  }
+
+  /** 稳定序列化：对象键按字典序，丢掉 undefined → 同一内容必得同一字符串 */
+  function stable(v) {
+    if (v === null || v === undefined) return 'null';
+    var t = typeof v;
+    if (t === 'number') return isFinite(v) ? String(v) : 'null';
+    if (t === 'boolean') return v ? 'true' : 'false';
+    if (t === 'string') return JSON.stringify(v);
+    if (v instanceof Array) {
+      var parts = [];
+      for (var i = 0; i < v.length; i++) parts.push(stable(v[i]));
+      return '[' + parts.join(',') + ']';
+    }
+    if (t === 'object') {
+      var keys = Object.keys(v).sort();
+      var kv = [];
+      for (var k = 0; k < keys.length; k++) {
+        if (v[keys[k]] === undefined) continue;
+        kv.push(JSON.stringify(keys[k]) + ':' + stable(v[keys[k]]));
+      }
+      return '{' + kv.join(',') + '}';
+    }
+    return 'null';
+  }
+
+  /** 32 位 FNV-1a，输出 8 位十六进制。够用且稳定，不依赖 crypto（verify 沙箱里没有）。 */
+  function hash(str) {
+    var h = 0x811c9dc5, s = String(str);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    return ('0000000' + h.toString(16)).slice(-8);
+  }
+
+  /* ---------------- 实体定义 ----------------
+   * 每类实体给出：容器 / 主键 / 内容指纹 / 能否新增 / 是否逐字段打补丁。
+   * ★ 「内容指纹」刻意【排除】本地时间戳（createdAt / updatedAt）与可重取缓存，
+   *   否则每台设备的本地时间不同，会被误判成「都改过」而互相覆盖。
+   */
+
+  function byId(list, key, id) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i][key] === id) return list[i];
+    }
+    return null;
+  }
+
+  function pick(obj, fields) {
+    var out = {};
+    for (var i = 0; i < fields.length; i++) out[fields[i]] = obj ? obj[fields[i]] : undefined;
+    return out;
+  }
+
+  /** 数组容器的 id 提取：必须返回【字符串主键】而不是记录本身。
+      （踩过：曾经写成 `return s.transactions`，于是 def.get(state, '[object Object]')
+        永远取不到记录 —— 表现为「改动不产出 op」，而且只有对象键的那几类正常。） */
+  function idsOf(list, key) {
+    var out = [];
+    for (var i = 0; i < (list || []).length; i++) {
+      var r = list[i];
+      if (r && r[key] !== undefined && r[key] !== null) out.push(r[key]);
+    }
+    return out;
+  }
+
+  /** 内容指纹：一律【排除】同步自己的修订戳字段。
+   *  ★ 踩过：snap 的指纹没排除 rt/rd，而 diffToOps 会把戳写在记录上，
+   *    于是「盖上戳」本身被算成内容变化 → 每次落盘都多出一条无意义的 op。 */
+  function contentHash(def, rec) {
+    var f = {};
+    Object.keys(rec || {}).forEach(function (k) {
+      if (k === 'rev' || k === 'rt' || k === 'rd') return;
+      f[k] = rec[k];
+    });
+    return def.hash(f);
+  }
+
+  var DEFS = {
+    tx: {
+      key: 'txId',
+      all: function (s) { return idsOf(s.transactions, 'txId'); },
+      get: function (s, id) { return byId(s.transactions || [], 'txId', id); },
+      hash: function (r) {
+        return hash(stable(pick(r, ['accountId', 'symbol', 'action', 'date', 'quantity',
+          'price', 'fee', 'amount', 'note'])));
+      },
+      canAdd: true,
+    },
+    rec: {
+      key: 'recId',
+      all: function (s) { return idsOf(s.received, 'recId'); },
+      get: function (s, id) { return byId(s.received || [], 'recId', id); },
+      hash: function (r) {
+        return hash(stable(pick(r, ['accountId', 'symbol', 'planId', 'exDividendDate',
+          'perShareAmount', 'qtyAtRecord', 'amount', 'source', 'year'])));
+      },
+      canAdd: true,
+    },
+    acc: {
+      key: 'accountId',
+      all: function (s) { return idsOf(s.accounts, 'accountId'); },
+      get: function (s, id) { return byId(s.accounts || [], 'accountId', id); },
+      hash: function (r) { return hash(stable(pick(r, ['name', 'type', 'sortOrder']))); },
+      canAdd: true,
+    },
+    exp: {
+      key: 'expenseId',
+      all: function (s) { return idsOf(s.expenses, 'expenseId'); },
+      get: function (s, id) { return byId(s.expenses || [], 'expenseId', id); },
+      hash: function (r) {
+        return hash(stable(pick(r, ['key', 'label', 'icon', 'iconAuto', 'monthlyAmount',
+          'enabled', 'sortOrder'])));
+      },
+      canAdd: true,
+    },
+    sym: {
+      key: 'symbol',
+      all: function (s) { return Object.keys(s.symbols || {}); },
+      get: function (s, id) { return (s.symbols || {})[id]; },
+      hash: function (r) {
+        /* 只取【用户意图】字段：logoUrl / logoState / domain 是可重取的缓存，
+           updatedAt 是行情写的本地时间 —— 都不该算作「用户改过」。 */
+        return hash(stable(pick(r, ['symbol', 'code', 'market', 'name', 'nameLocked',
+          'nameSuspect', 'type', 'costMethod', 'dividendBasis', 'costRecovered'])));
+      },
+      canAdd: true,
+    },
+    snap: {
+      key: 'date',
+      all: function (s) { return Object.keys(s.snapshots || {}); },
+      get: function (s, id) { return (s.snapshots || {})[id]; },
+      hash: function (r) {
+        /* 只用这几个【客观字段】，刻意不遍历 Object.keys ——
+           既排除 fx（本机汇率，两机不同会每天互相改写），
+           也顺带排除 diffToOps 写在记录上的 rev/rt/rd 修订戳。 */
+        return hash(stable(pick(r, ['mv', 'cost', 'pred', 'recv'])));
+      },
+      /* ★ 快照按日期【写一次】：两台设备同一天各自算出的 mv 可能因行情新旧差几块钱，
+         若允许 LWW 会每天互相改写。先到先得，只补本机没有的日期。 */
+      oncePerId: true,
+      canAdd: true,
+    },
+    set: {
+      key: null,
+      all: function () { return ['app_settings']; },
+      get: function (s) { return s.settings; },
+      hash: function (r) { return hash(stable(pick(r || {}, SETTINGS_SYNC))); },
+      patch: true,       // 合并时按白名单逐字段打补丁，绝不整块替换（否则会连 OCR Key 一起冲掉）
+      canAdd: false,
+    },
+    proj: {
+      key: null,
+      all: function () { return ['proj_default']; },
+      get: function (s) { return s.projection; },
+      hash: function (r) {
+        return hash(stable(pick(r || {}, ['monthlyInvest', 'years', 'reinvestRatio',
+          'divGrowthRate', 'startAssets'])));
+      },
+      canAdd: false,
+    },
+  };
+
+  var TYPES = ['tx', 'rec', 'acc', 'exp', 'sym', 'snap', 'set', 'proj'];
+
+  function vid(t, id) { return t + ':' + id; }
+
+  /* ---------------- syncMeta 容器 ---------------- */
+
+  var META_DEFAULT = {
+    deviceId: null, enabled: false, token: null, gistId: null,
+    version: 0, etag: null, lastOkAt: null,
+    failSince: null, lastErr: null, everPaired: false,
+    outbox: [], versions: {}, tombstones: {},
+  };
+
+  function meta(state) {
+    if (!state.syncMeta || typeof state.syncMeta !== 'object') state.syncMeta = {};
+    var m = state.syncMeta;
+    if (!Array.isArray(m.outbox)) m.outbox = [];
+    if (!m.versions || typeof m.versions !== 'object') m.versions = {};
+    if (!m.tombstones || typeof m.tombstones !== 'object') m.tombstones = {};
+    if (m.enabled !== true) m.enabled = false;
+    if (m.everPaired !== true) m.everPaired = false;
+    if (m.version === undefined || m.version === null) m.version = 0;
+    if (!m.deviceId) m.deviceId = U.uid('dev');
+    return m;
+  }
+
+  function makeStamp(rev, rt, rd) {
+    return { rev: U.n0(rev), rt: U.n0(rt), rd: String(rd === undefined || rd === null ? '' : rd) };
+  }
+
+  function stampOf(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    if (obj.rev === undefined || obj.rev === null) return null;
+    return makeStamp(obj.rev, obj.rt, obj.rd);
+  }
+
+  /** a 是否比 b 更新。rev → rt → rd 依次比较，rd 保证任意两端得出同一结论。 */
+  function newer(a, b) {
+    if (!b) return !!a;
+    if (!a) return false;
+    if (U.n0(a.rev) !== U.n0(b.rev)) return U.n0(a.rev) > U.n0(b.rev);
+    if (U.n0(a.rt) !== U.n0(b.rt)) return U.n0(a.rt) > U.n0(b.rt);
+    return String(a.rd || '') > String(b.rd || '');
+  }
+
+  /** 现在（毫秒）。走 Date.now() 便于 verify 用假时钟冻结。 */
+  function nowMs() { return Date.now(); }
+
+  /* ---------------- 内容变化 → op（写入前调用） ---------------- */
+
+  /**
+   * 把 state 里所有「内容变了 / 本地没了 / 还没登记过」的记录算成 op，并更新 versions。
+   * 【幂等】：内容没变就不会再产出 op，也不会改动任何东西。
+   *
+   * opts.seed = true 时走「首次纳入」语义：未登记的记录只登记、不产出 op。
+   * 供 seedVersions() 使用 —— 那才是「把既有数据纳入同步」的正确入口。
+   *
+   * 返回 { ops, changed }：ops 是本次产生的增量（也追加进了 outbox，除非 opts.noQueue）。
+   */
+  function diffToOps(state, opts) {
+    opts = opts || {};
+    var m = meta(state);
+    var dev = m.deviceId;
+    var t = nowMs();
+    var ops = [];
+    var visible = {};
+
+    for (var ti = 0; ti < TYPES.length; ti++) {
+      var type = TYPES[ti];
+      var def = DEFS[type];
+      var ids = def.all(state);
+
+      for (var ii = 0; ii < ids.length; ii++) {
+        var id = ids[ii];
+        var rec = def.get(state, id);
+        if (!rec || typeof rec !== 'object') continue;
+        var key = vid(type, id);
+        visible[key] = true;
+
+        var h = contentHash(def, rec);
+        var known = m.versions[key];
+
+        if (known && known.q === 1) {
+          if (known.h === h) {
+            /* ① 内容没变 → 无事可做（这是绝大多数保存的情形） */
+            if (!stampOf(rec)) {
+              /* 极少数：账本里有，记录上却没戳 → 补上，不再发 op */
+              rec.rev = known.rev; rec.rt = known.rt; rec.rd = known.rd;
+            }
+            continue;
+          }
+          /* ② 内容变了 → 修订号 +1，产出 op */
+          var revEdit = U.n0(known.rev) + 1;
+          rec.rev = revEdit; rec.rt = t; rec.rd = dev;
+          known.rev = revEdit; known.rt = t; known.rd = dev; known.h = h;
+          ops.push({ t: type, id: id, s: makeStamp(revEdit, t, dev), d: 0 });
+          continue;
+        }
+
+        /* ③ 账本里没有这条 → 是本机新产生的记录（用户新增、或自动登记的到账），
+              必须产出 op 推给远端，否则「手机加仓」永远到不了平板。 */
+        if (!opts.seed) {
+          var revNew = U.n0(rec.rev) || 1;
+          rec.rev = revNew; rec.rt = t; rec.rd = dev;
+          m.versions[key] = { rev: revNew, rt: t, rd: dev, h: h, q: 1 };
+          ops.push({ t: type, id: id, s: makeStamp(revNew, t, dev), d: 0 });
+          continue;
+        }
+
+        /* ④ 首次纳入既有数据（只在 seedVersions 里走到）：只登记，不产出 op。
+              起点从 createdAt 派生，好让两端对同一条的起点尽量接近。 */
+        var seedRev = U.n0(rec.rev) || 1;
+        var seedRt = rec.rt !== undefined && rec.rt !== null ? U.n0(rec.rt) : toMs(rec.createdAt, t);
+        var seedRd = rec.rd || dev;
+        rec.rev = seedRev; rec.rt = seedRt; rec.rd = seedRd;
+        m.versions[key] = { rev: seedRev, rt: seedRt, rd: seedRd, h: h, q: 1 };
+      }
+    }
+
+    /* ⑤ 账本里有「q=1」（本机见过实体）却已看不见 → 本机把它删了 → 发墓碑。
+          q 不是 1 的说明本机从来没有这条（别的设备加的），绝不当成删除，否则会误删别人的数据。 */
+    var vkeys = Object.keys(m.versions);
+    for (var vi = 0; vi < vkeys.length; vi++) {
+      var vk = vkeys[vi];
+      var entry = m.versions[vk];
+      if (entry.q !== 1) continue;                 // 本机从未持有 → 留着当「远端已知」，不发墓碑
+      if (visible[vk]) continue;
+      var cut = vk.indexOf(':');
+      var vt = vk.slice(0, cut);
+      if (!DEFS[vt]) { delete m.versions[vk]; continue; }
+      var vid0 = vk.slice(cut + 1);
+      var tomb = m.tombstones[vk];
+
+      /* ★ 修复「墓碑修订号漂移」：墓碑一旦发出，它的 (rev, rt, rd) 就【冻结】。
+         曾经写成每次 diff 都 entry.rev + 1，后果是——
+           ① 别处新加的远端 op 需要救活这条时，比不过被反复推高的墓碑 → 永远救不活；
+           ② 墓碑自己每次落盘都产出 op → 无谓的网络流量。
+         冻结点取「墓碑自己的时刻」；只有拿不到时才回落到当下，保证墓碑在「先删除后编辑」里不输。 */
+      var nstamp = tomb
+        ? makeStamp(tomb.rev, tomb.rt, tomb.rd)
+        : makeStamp(U.n0(entry.rev) + 1, U.n0(entry.rt) || t, dev);
+      if (!tomb || newer(nstamp, makeStamp(tomb.rev, tomb.rt, tomb.rd))) {
+        m.tombstones[vk] = { rev: nstamp.rev, rt: nstamp.rt, rd: nstamp.rd };
+        ops.push({ t: vt, id: vid0, s: nstamp, d: 1 });
+      }
+      delete m.versions[vk];
+    }
+
+    if (!opts.noQueue) {
+      for (var oi = 0; oi < ops.length; oi++) m.outbox.push(ops[oi]);
+    }
+    gcTombstones(m);
+    return { ops: ops, changed: ops.length };
+  }
+
+  /** 把既有数据「登记」进账本，但不产生任何 op（首次落盘 / 打开同步时用） */
+  function seedVersions(state) {
+    return diffToOps(state, { noQueue: true, seed: true }).ops.length;
+  }
+
+  /** 墓碑清单（推给远端用）：一条删除必须让新设备也知道「这条是被删了」，而不只是「没有」 */
+  function tombstoneList(m) {
+    var out = [];
+    Object.keys(m.tombstones || {}).forEach(function (vk) {
+      var cut = vk.indexOf(':');
+      var vt = vk.slice(0, cut);
+      if (!DEFS[vt]) return;
+      var t = m.tombstones[vk];
+      out.push({ t: vt, id: vk.slice(cut + 1), s: makeStamp(t.rev, t.rt, t.rd) });
+    });
+    return out;
+  }
+
+  /** 墓碑封顶：按 (rt, rev, id) 最老的裁掉，避免无限增长 */
+  function gcTombstones(m) {
+    var keys = Object.keys(m.tombstones || {});
+    if (keys.length <= TOMB_CAP) return 0;
+    keys.sort(function (a, b) {
+      var x = m.tombstones[a], y = m.tombstones[b];
+      if (U.n0(x.rt) !== U.n0(y.rt)) return U.n0(x.rt) - U.n0(y.rt);
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    var drop = keys.length - TOMB_CAP;
+    for (var i = 0; i < drop; i++) delete m.tombstones[keys[i]];
+    return drop;
+  }
+
+  /* ---------------- 应用远端 op ---------------- */
+
+  function containerList(state, type) {
+    if (type === 'tx') return state.transactions;
+    if (type === 'rec') return state.received;
+    if (type === 'acc') return state.accounts;
+    if (type === 'exp') return state.expenses;
+    return null;
+  }
+
+  function containerMap(state, type) {
+    if (type === 'sym') return state.symbols || (state.symbols = {});
+    if (type === 'snap') return state.snapshots || (state.snapshots = {});
+    return null;
+  }
+
+  function addRecord(state, type, id, next) {
+    if (type === 'tx') { state.transactions.push(next); return true; }
+    if (type === 'rec') { state.received.push(next); return true; }
+    if (type === 'acc') { state.accounts.push(next); return true; }
+    if (type === 'exp') { state.expenses.push(next); return true; }
+    var map = containerMap(state, type);
+    if (map) { map[id] = next; return true; }
+    return false;
+  }
+
+  function replaceRecord(state, type, id, next, def) {
+    var list = containerList(state, type);
+    if (list) {
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && list[i][def.key] === id) { list[i] = next; return true; }
+      }
+      return false;
+    }
+    var map = containerMap(state, type);
+    if (map) { map[id] = next; return true; }
+    return false;
+  }
+
+  function removeRecord(state, type, id, def) {
+    var list = containerList(state, type);
+    if (list) {
+      for (var i = list.length - 1; i >= 0; i--) {
+        if (list[i] && list[i][def.key] === id) { list.splice(i, 1); return true; }
+      }
+      return false;
+    }
+    var map = containerMap(state, type);
+    if (map && map[id] !== undefined) { delete map[id]; return true; }
+    return false;
+  }
+
+  /** 推给远端前把同步专用的戳字段摘掉（线路上用 op 里的 s 表达） */
+  function stripSyncFields(rec) {
+    var out = {};
+    Object.keys(rec || {}).forEach(function (k) {
+      if (k === 'rev' || k === 'rt' || k === 'rd') return;
+      out[k] = rec[k];
+    });
+    return out;
+  }
+
+  /**
+   * 就地把远端 op 应用到 state。返回 { applied, skipped, deleted }。
+   * 必须【幂等】：网络重投、重复拉取都会发生，同一 op 应用两次结果必须一致。
+   * 这里顺带更新 versions，因此随后的 diff 天然产出 0 条 op（双重防回声）。
+   */
+  function applyOps(state, ops) {
+    var m = meta(state);
+    var res = { applied: 0, skipped: 0, deleted: 0 };
+    if (!Array.isArray(ops)) return res;
+
+    /* 账本条目：q=1 本机持有；q=0 只是「知道有这条」（远端删除时这样记，
+       免得下一步 diff 把它当成「我删的」再发一次墓碑）。 */
+    function note(key, stamp, h, hasLocal) {
+      m.versions[key] = {
+        rev: U.n0(stamp.rev), rt: U.n0(stamp.rt), rd: String(stamp.rd || ''),
+        h: h, q: hasLocal ? 1 : 0,
+      };
+    }
+
+    for (var i = 0; i < ops.length; i++) {
+      var op = ops[i];
+      if (!op || !op.t) { res.skipped++; continue; }
+      var def = DEFS[op.t];
+      if (!def) { res.skipped++; continue; }
+      var key = vid(op.t, op.id);
+      var st = makeStamp(op.s && op.s.rev, op.s && op.s.rt, op.s && op.s.rd);
+      var local = def.get(state, op.id);
+      var localStamp = stampOf(local);
+
+      /* ---- 删除 ---- */
+      if (op.d) {
+        /* 本地在墓碑之后又被改过（戳更新）→ 保留本地；否则删除获胜 */
+        if (local && localStamp && newer(localStamp, st)) {
+          note(key, localStamp, contentHash(def, local), true);
+        } else {
+          m.tombstones[key] = { rev: st.rev, rt: st.rt, rd: st.rd };
+          if (local) { removeRecord(state, op.t, op.id, def); res.deleted++; }
+          note(key, st, undefined, false);
+        }
+        res.applied++;
+        continue;
+      }
+
+      /* ---- 新增 / 修改 ---- */
+      var remoteRec = op.r;
+      if (!remoteRec || typeof remoteRec !== 'object') { res.skipped++; continue; }
+
+      /* 快照：按日期写一次，先到先得 */
+      if (def.oncePerId && local) {
+        note(key, localStamp || st, contentHash(def, local), true);
+        res.skipped++;
+        continue;
+      }
+
+      /* 墓碑压过「新增」；只有远端戳更新（= 墓碑之后的新内容）才允许覆盖墓碑 */
+      var tomb = m.tombstones[key];
+      if (tomb && !newer(st, makeStamp(tomb.rev, tomb.rt, tomb.rd))) {
+        res.skipped++;
+        continue;
+      }
+      if (tomb) delete m.tombstones[key];
+
+      /* 本地这条更旧才允许替换 */
+      if (local && localStamp && !newer(st, localStamp)) {
+        note(key, localStamp, contentHash(def, local), true);
+        res.skipped++;
+        continue;
+      }
+
+      var next = stripSyncFields(remoteRec);
+      next.rev = st.rev; next.rt = st.rt; next.rd = st.rd;
+
+      if (local) {
+        if (op.t === 'set') {
+          /* settings：按白名单逐字段打补丁，绝不整块替换 —— 否则会连 OCR Key 一起冲掉。
+             但若本地 settings 上还没有戳，说明它从未纳入同步，先整块打底再盖字段。 */
+          if (!stampOf(local)) {
+            Object.keys(remoteRec).forEach(function (k) {
+              if (k === 'ocr' || k === 'apiKey') return;
+              local[k] = clone(remoteRec[k]);
+            });
+          } else {
+            for (var si = 0; si < SETTINGS_SYNC.length; si++) {
+              var f = SETTINGS_SYNC[si];
+              if (remoteRec[f] !== undefined) local[f] = clone(remoteRec[f]);
+            }
+          }
+          local.rev = st.rev; local.rt = st.rt; local.rd = st.rd;
+        } else if (op.t === 'proj') {
+          Object.keys(remoteRec).forEach(function (k) { local[k] = clone(remoteRec[k]); });
+          local.rev = st.rev; local.rt = st.rt; local.rd = st.rd;
+        } else {
+          replaceRecord(state, op.t, op.id, next, def);
+        }
+      } else if (def.canAdd) {
+        addRecord(state, op.t, op.id, next);
+      } else {
+        res.skipped++; continue;
+      }
+
+      var nowRec = (op.t === 'set' || op.t === 'proj') ? null : def.get(state, op.id);
+      note(key, st, nowRec ? contentHash(def, nowRec) : contentHash(def, remoteRec), true);
+      res.applied++;
+    }
+    return res;
+  }
+
+  /* ---------------- 生成 snapshot / 远端负载 ---------------- */
+
+  /** snapshot = 全量核心数据（含戳），供新设备一次拉完即可用 */
+  function buildSnapshot(state) {
+    var snap = {
+      accounts: [], symbols: {}, transactions: [], received: [],
+      expenses: [], snapshots: {}, settings: {}, projection: {},
+    };
+    for (var ti = 0; ti < TYPES.length; ti++) {
+      var type = TYPES[ti];
+      var def = DEFS[type];
+      var ids = def.all(state);
+      for (var ii = 0; ii < ids.length; ii++) {
+        var id = ids[ii];
+        var rec = def.get(state, id);
+        if (!rec || typeof rec !== 'object') continue;
+        var copy = stripSyncFields(rec);
+        var st = stampOf(rec) || makeStamp(1, toMs(rec.createdAt, 0), 'seed');
+        copy.rev = st.rev; copy.rt = st.rt; copy.rd = st.rd;
+        if (type === 'set') snap.settings = copy;
+        else if (type === 'proj') snap.projection = copy;
+        else if (type === 'sym') snap.symbols[id] = copy;
+        else if (type === 'snap') snap.snapshots[id] = copy;
+        else if (type === 'tx') snap.transactions.push(copy);
+        else if (type === 'rec') snap.received.push(copy);
+        else if (type === 'acc') snap.accounts.push(copy);
+        else if (type === 'exp') snap.expenses.push(copy);
+      }
+    }
+    /* ★ settings 只带白名单字段：绝不让 OCR Key 上路 */
+    var s = snap.settings || {};
+    var slim = {};
+    for (var si = 0; si < SETTINGS_SYNC.length; si++) {
+      var f = SETTINGS_SYNC[si];
+      if (s[f] !== undefined) slim[f] = s[f];
+    }
+    if (s.rev !== undefined) { slim.rev = s.rev; slim.rt = s.rt; slim.rd = s.rd; }
+    snap.settings = slim;
+    return snap;
+  }
+
+  /** 用 snapshot 把本地登记满（首次配对后防回声） */
+  function adoptVersions(state, remote) {
+    var m = meta(state);
+    var snap = (remote && remote.snapshot) || {};
+    var n = 0;
+    for (var ti = 0; ti < TYPES.length; ti++) {
+      var type = TYPES[ti];
+      var def = DEFS[type];
+      var ids = def.all(snap);
+      for (var ii = 0; ii < ids.length; ii++) {
+        var id = ids[ii];
+        var rec = def.get(snap, id);
+        if (!rec || typeof rec !== 'object') continue;
+        var st = stampOf(rec);
+        if (!st) continue;
+        var key = vid(type, id);
+        var cur = m.versions[key];
+        if (cur && cur.q === 1 && !newer(st, makeStamp(cur.rev, cur.rt, cur.rd))) continue;
+        var localRec = def.get(state, id);
+        m.versions[key] = {
+          rev: st.rev, rt: st.rt, rd: st.rd,
+          h: contentHash(def, localRec || rec),
+          q: localRec ? 1 : 0,
+        };
+        n++;
+      }
+    }
+    return n;
+  }
+
+  /* ---------------- 首次配对 / 整份对齐 ---------------- */
+
+  /**
+   * 用远端数据对齐本地。
+   *   'overwrite' 清空本地核心容器，以远端为准（新设备首次配对）
+   *   'merge'     两边并集，按主键去重、按修订戳取新（已记过账的设备接入时用）
+   * 返回 { mode, applied, skipped, deleted }。
+   */
+  function mergeRemote(state, remote, mode) {
+    var m = meta(state);
+    var useOverwrite = mode === 'overwrite';
+    var snap = (remote && remote.snapshot) || {};
+
+    if (useOverwrite) {
+      state.transactions = [];
+      state.received = [];
+      state.accounts = [];
+      state.expenses = [];
+      state.symbols = {};
+      state.snapshots = {};
+      /* 清空 versions，但【保留 tombstones 与连接信息】——
+         否则下一步会认为「我把所有东西都删了」并到处发墓碑。 */
+      m.versions = {};
+      /* ★ 必须在这次赋值【之后】重新取一次 meta。
+         applyOps 内部会重新调用 meta(state)、发现 versions 不是对象就换成新对象，
+         于是这里手里的 m 会变成悬空引用 —— 后面写 m.version / m.everPaired 全部落空。
+         （踩过：表现为「覆盖式对齐后版本号永远是 0」，同步会因此反复重推。） */
+      m = meta(state);
+    }
+
+    var all = [];
+
+    var all = [];
+
+    /* 先灌墓碑：它决定了随后哪些记录会被拒绝（删除必胜） */
+    var tombs = (remote && remote.tombstones) || [];
+    for (var xi = 0; xi < tombs.length; xi++) {
+      var tb = tombs[xi];
+      if (!tb || !DEFS[tb.t]) continue;
+      all.push({ t: tb.t, id: tb.id, d: 1, s: makeStamp(tb.s && tb.s.rev, tb.s && tb.s.rt, tb.s && tb.s.rd) });
+    }
+
+    for (var ti = 0; ti < TYPES.length; ti++) {
+      var type = TYPES[ti];
+      var def = DEFS[type];
+      var ids = def.all(snap);
+      for (var ii = 0; ii < ids.length; ii++) {
+        var id = ids[ii];
+        var rec = def.get(snap, id);
+        if (!rec || typeof rec !== 'object') continue;
+        all.push({
+          t: type, id: id, d: 0, r: rec,
+          s: stampOf(rec) || makeStamp(1, toMs(rec.createdAt, 0), 'remote'),
+        });
+      }
+    }
+
+    /* ops 是 snapshot 之后的最新增量：必须补在里面，否则首次配对漏拉最近改动。
+       （对同一 id 重复给出没关系——戳相同，第二次会被 newer() 挡掉。） */
+    var ops = (remote && remote.ops) || [];
+    for (var oi = 0; oi < ops.length; oi++) {
+      var op = ops[oi];
+      if (!op || !DEFS[op.t]) continue;
+      var d = DEFS[op.t];
+      var payload = op.r;
+      if (!payload && !op.d) {
+        payload = op.t === 'set' ? snap.settings
+          : op.t === 'proj' ? snap.projection
+            : d.get(snap, op.id);
+      }
+      if (!op.d && (!payload || typeof payload !== 'object')) continue;
+      all.push({
+        t: op.t, id: op.id, d: op.d ? 1 : 0, r: payload,
+        s: makeStamp(op.s && op.s.rev, op.s && op.s.rt, op.s && op.s.rd),
+      });
+    }
+
+    var res = applyOps(state, all);
+    res.mode = useOverwrite ? 'overwrite' : 'merge';
+    m.version = U.n0(remote && remote.version);
+    m.everPaired = true;
+    /* 远端 snapshot 里还有没被 op 覆盖到的戳，一并登记，避免回声 */
+    adoptVersions(state, remote);
+    return res;
+  }
+
+  /**
+   * 把 outbox 里的 op 补上 payload（取自本地 state），生成要推送的远端文件。
+   * 返回 { v, version, deviceId, at, snapshot, tombstones, ops }。
+   */
+  function buildRemote(state, opts) {
+    opts = opts || {};
+    var m = meta(state);
+    var src = opts.ops || m.outbox || [];
+    /* snapshot 只算一次：每个 op 都调一次 buildSnapshot 是平方级浪费 */
+    var snap = opts.snapshot === null ? null : (opts.snapshot || buildSnapshot(state));
+    var out = [];
+    for (var i = 0; i < src.length; i++) {
+      var op = src[i];
+      var def = DEFS[op.t];
+      if (!def) continue;
+      var one = { t: op.t, id: op.id, s: makeStamp(op.s && op.s.rev, op.s && op.s.rt, op.s && op.s.rd), d: op.d ? 1 : 0 };
+      if (!op.d) {
+        var rec = op.t === 'set' ? (snap ? snap.settings : state.settings)
+          : op.t === 'proj' ? (snap ? snap.projection : state.projection)
+            : def.get(state, op.id);
+        if (!rec) continue;                       // 已删除：跳过（墓碑才是它的归宿）
+        one.r = stripSyncFields(rec);
+      }
+      out.push(one);
+      if (out.length >= 500) break;
+    }
+    return {
+      v: 1,
+      version: U.n0(opts.version !== undefined ? opts.version : m.version) + 1,
+      deviceId: m.deviceId,
+      at: U.nowStamp(),
+      snapshot: snap,
+      /* ★ 墓碑必须一起上路：没有它，新设备无法区分「这条被删了」和「本来就没有」，
+         于是被删的记录会在它那儿复活。 */
+      tombstones: tombstoneList(m),
+      ops: out,
+    };
+  }
+
+  /* ---------------- 首次接入的安全判定（见计划 §4） ---------------- */
+
+  /**
+   *   · 从未配对过，且本机是空白（无交易、无到账） → 'overwrite'（无摩擦）
+   *   · 从未配对过，但本机已有自己的记账数据       → 'ask'（界面弹窗让用户选）
+   *   · 曾配对过（换设备/重装后重连）              → 'merge'（绝不覆盖）
+   */
+  function firstSyncMode(state) {
+    var m = meta(state);
+    if (m.everPaired) return 'merge';
+    var hasData = (state.transactions && state.transactions.length > 0) ||
+      (state.received && state.received.length > 0);
+    return hasData ? 'ask' : 'overwrite';
+  }
+
+  /* ---------------- 状态自述（给界面用） ---------------- */
+
+  function status(state) {
+    var m = state && state.syncMeta;
+    if (!m) return { enabled: false, pending: 0, version: 0, lastOkAt: null };
+    return {
+      enabled: m.enabled === true,
+      paired: !!(m.token && m.gistId),
+      pending: (m.outbox || []).length,
+      version: U.n0(m.version),
+      lastOkAt: m.lastOkAt || null,
+      failSince: m.failSince || null,
+      lastErr: m.lastErr || null,
+      deviceId: m.deviceId,
+      everPaired: m.everPaired === true,
+      tombstoneCount: Object.keys(m.tombstones || {}).length,
+    };
+  }
+
+  return {
+    OPS_CAP: OPS_CAP,
+    TOMB_CAP: TOMB_CAP,
+    SETTINGS_SYNC: SETTINGS_SYNC,
+    TYPES: TYPES,
+    DEFS: DEFS,
+    META_DEFAULT: META_DEFAULT,
+    meta: meta,
+    vid: vid,
+    hash: hash,
+    stable: stable,
+    pick: pick,
+    idsOf: idsOf,
+    contentHash: contentHash,
+    newer: newer,
+    makeStamp: makeStamp,
+    stampOf: stampOf,
+    stripSyncFields: stripSyncFields,
+    diffToOps: diffToOps,
+    seedVersions: seedVersions,
+    tombstoneList: tombstoneList,
+    applyOps: applyOps,
+    buildSnapshot: buildSnapshot,
+    buildRemote: buildRemote,
+    adoptVersions: adoptVersions,
+    mergeRemote: mergeRemote,
+    firstSyncMode: firstSyncMode,
+    gcTombstones: gcTombstones,
+    status: status,
+    nowMs: nowMs,
+    toMs: toMs,
+  };
+})();
+
+
+/* ==================== src/sync.js ==================== */
+/* ==================== 跨设备同步 · 编排与传输 ====================
+ * 这一层是【薄壳】：把 sync-core 的纯逻辑接到「存储钩子 + 网络 + 定时器」上。
+ * 所有同步语义都在 sync-core（纯函数，verify 可独立复算）；这里只做编排。
+ *
+ * 中转站 = 一个 GitHub Gist 里的单个文件（xiji-sync.json）。没有自建后端。
+ *
+ * 三条刻意保持的性质（都是计划里的硬约束）：
+ *   ① transport 可注入 —— uitest 是断网跑的，同步层直连网络会破坏这条原则。
+ *   ② outbox 与 state 同一次落盘 —— 挂 storage 的落盘前钩子，单文档写入天然原子。
+ *   ③ 关闭同步 = 零外发 —— stop() 会清定时器并摘掉钩子；任何请求都先过 enabled 判断。
+ *
+ * 冲突与错误处理见 docs/跨设备同步-方案评估与设计.md：
+ *   ETag 做乐观锁（If-Match 撞车 → 拉回合并重试），限流按 X-RateLimit-Reset 精确退避，
+ *   连续失败要在界面上如实说明（禁止静默失败）。
+ */
+XJ.sync = (function () {
+  var U = XJ.util;
+  var CORE = XJ.syncCore;
+
+  var FILE_NAME = 'xiji-sync.json';
+  var GIST_DESC = '息记复刻版 · 跨设备同步数据（请勿公开分享）';
+  /* GitHub API 根地址。做成可覆盖的，是为了让 tools/test-syncnet.mjs 能把它指向
+     一个【进程内的假 Gist 服务】—— 于是网络层的 401/403/404/412/429/500/断网/ETag
+     这些分支都能被真 fetch 覆盖，而不需要碰真 GitHub、也不需要联网。 */
+  var API = (typeof XJ_SYNC_API_BASE === 'string' && XJ_SYNC_API_BASE) || 'https://api.github.com';
+
+  function setApiBase(base) { API = String(base || 'https://api.github.com').replace(/\/+$/, ''); }
+
+  var POLL_MS = 60000;          // 前台轮询间隔（与行情刷新同节奏）
+  var PUSH_DELAY_MS = 2000;     // 本地改动后的推送防抖
+  var FIRST_PULL_TIMEOUT = 4000; // 首屏等一次对齐的上限
+  var VISIBLE_STALE_MS = 3000;  // 回前台时超过这么久没同步就立刻补一次
+  var RETRY_MAX = 3;            // 412 撞车的重试次数
+
+  var timer = null;
+  var pushTimer = null;
+  var running = false;
+  var applyingRemote = false;   // apply 远端期间抑制 op 发射
+  var transport = null;
+  var lastAttemptAt = 0;
+  var listeners = [];
+
+  function state() { return (XJ.store && XJ.store.state) || null; }
+  function meta() {
+    var s = state();
+    if (!s) return null;
+    return CORE.meta(s);
+  }
+  function isOn() {
+    var m = meta();
+    return !!(m && m.enabled && m.token && m.gistId);
+  }
+
+  /* ---------------- 状态自述 ---------------- */
+
+  function status() {
+    var s = state();
+    if (!s) return { enabled: false, pending: 0, paired: false };
+    var st = CORE.status(s);
+    st.busy = running;
+    st.lastAttemptAt = lastAttemptAt || null;
+    st.transport = transport && transport.name ? transport.name : 'none';
+    return st;
+  }
+
+  function notify() {
+    for (var i = 0; i < listeners.length; i++) {
+      try { listeners[i](); } catch (e) { console.error('[sync] listener', e); }
+    }
+  }
+
+  function onChange(fn) { listeners.push(fn); }
+
+  /* ---------------- 存储钩子：把本轮变更算成增量 op ---------------- */
+
+  /** 落盘前钩子。★ 必须同步、极轻、绝不抛。 */
+  function beforeSave(st) {
+    if (!st) return;
+    if (applyingRemote) return;               // 应用远端期间不发射
+    try {
+      var r = CORE.diffToOps(st);
+      if (r.changed && isOn()) schedulePush();
+    } catch (e) {
+      console.error('[sync] diff', e);
+    }
+  }
+
+  /** 挂上钩子，并把既有数据登记进修订账本（不产生任何 op）。
+   *  幂等：重复调用无副作用。 */
+  function attach() {
+    if (XJ.storage && XJ.storage.setOnBeforeSave) XJ.storage.setOnBeforeSave(beforeSave);
+    var s = state();
+    if (s) { try { CORE.diffToOps(s, { noQueue: true }); } catch (e) { console.error('[sync] seed', e); } }
+    return true;
+  }
+
+  function detach() {
+    if (XJ.storage && XJ.storage.setOnBeforeSave) XJ.storage.setOnBeforeSave(null);
+  }
+
+  /* ---------------- 传输层：内存实现（uitest / 单测用，不出网） ---------------- */
+
+  /** 内存假 Gist：{ files: { name: { content } }, history, version } */
+  function createMemoryTransport(opts) {
+    opts = opts || {};
+    var store = {};
+    function key(id) { return id || 'default'; }
+    return {
+      name: 'memory',
+      /* 直接读写内部数据，供测试构造「另一个设备」看到的远端 */
+      _dump: function (id) { return store[key(id)] ? JSON.parse(store[key(id)]) : null; },
+      _load: function (id, obj) { store[key(id)] = JSON.stringify(obj); },
+      _requests: 0,
+      pull: function (cfg) {
+        this._requests++;
+        var raw = store[key(cfg.gistId)];
+        if (!raw) return Promise.resolve({ status: 404 });
+        var obj = JSON.parse(raw);
+        var etag = 'W/"mem-' + (obj.version || 0) + '"';
+        if (!cfg.force && cfg.etag && cfg.etag === etag) return Promise.resolve({ status: 304, etag: etag });
+        return Promise.resolve({ status: 200, etag: etag, data: obj });
+      },
+      push: function (cfg) {
+        this._requests++;
+        var k = key(cfg.gistId);
+        var raw = store[k];
+        var obj = JSON.parse(JSON.stringify(cfg.data));
+        store[k] = JSON.stringify(obj);
+        return Promise.resolve({ status: 200, etag: 'W/"mem-' + (obj.version || 0) + '"' });
+      },
+      /* 账户与 Gist 发现接口（内存实现只提供最小可用集） */
+      whoami: function () {
+        this._requests++;
+        return Promise.resolve({ status: 200, data: { login: 'memory-user' }, scopes: 'gist' });
+      },
+      listGists: function () {
+        this._requests++;
+        var out = [];
+        Object.keys(store).forEach(function (k) {
+          out.push({ id: k, description: GIST_DESC, files: buildFiles({}) });
+        });
+        return Promise.resolve({ status: 200, data: out });
+      },
+      createGist: function (cfg) {
+        this._requests++;
+        var id = 'mem_' + Date.now().toString(36);
+        store[id] = JSON.stringify(cfg.data);
+        return Promise.resolve({ status: 201, data: { id: id } });
+      },
+      deleteGist: function (id) { this._requests++; delete store[key(id)]; return Promise.resolve({ status: 204 }); },
+    };
+  }
+
+  /* ---------------- 传输层：真实 GitHub Gist（纯 fetch，不引任何 SDK） ---------------- */
+
+  function ghHeaders(token, extra) {
+    var h = { 'Accept': 'application/vnd.github+json' };
+    if (token) h['Authorization'] = 'Bearer ' + token;
+    Object.keys(extra || {}).forEach(function (k) { h[k] = extra[k]; });
+    return h;
+  }
+
+  /** 把 gist 响应的 files 转成一份文本（找不到目标文件时返回 null） */
+  function readFile(gist, name) {
+    var f = gist && gist.files && gist.files[name];
+    if (!f) return null;
+    if (typeof f.content === 'string' && f.content) return f.content;
+    return null;
+  }
+
+  function buildFiles(data) {
+    var files = {};
+    files[FILE_NAME] = { content: JSON.stringify(data) };
+    return files;
+  }
+
+  function createWebTransport() {
+    return {
+      name: 'gist',
+
+      whoami: function (cfg) {
+        return fetch(API + '/user', { headers: ghHeaders(cfg.token), cache: 'no-store' })
+          .then(function (r) {
+            return r.json().catch(function () { return null; }).then(function (body) {
+              return {
+                status: r.status,
+                scopes: r.headers.get('x-oauth-scopes'),
+                rateRemaining: r.headers.get('x-ratelimit-remaining'),
+                data: body,
+              };
+            });
+          });
+      },
+
+      listGists: function (cfg) {
+        return fetch(API + '/gists?per_page=100', { headers: ghHeaders(cfg.token), cache: 'no-store' })
+          .then(function (r) {
+            return r.json().catch(function () { return null; }).then(function (body) {
+              return { status: r.status, data: body, scopes: r.headers.get('x-oauth-scopes') };
+            });
+          });
+      },
+
+      createGist: function (cfg) {
+        return fetch(API + '/gists', {
+          method: 'POST',
+          headers: ghHeaders(cfg.token, { 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ description: GIST_DESC, public: false, files: buildFiles(cfg.data) }),
+        }).then(function (r) {
+          return r.json().catch(function () { return null; }).then(function (body) {
+            return { status: r.status, data: body };
+          });
+        });
+      },
+
+      deleteGist: function (id, cfg) {
+        return fetch(API + '/gists/' + encodeURIComponent(id), {
+          method: 'DELETE', headers: ghHeaders(cfg.token),
+        }).then(function (r) { return { status: r.status }; });
+      },
+
+      pull: function (cfg) {
+        /* force=true 时无条件重取（撞车重试要用），否则带 If-None-Match 省流量 */
+        var headers = ghHeaders(cfg.token, (!cfg.force && cfg.etag) ? { 'If-None-Match': cfg.etag } : {});
+        return fetch(API + '/gists/' + encodeURIComponent(cfg.gistId), { headers: headers, cache: 'no-store' })
+          .then(function (r) {
+            var out = {
+              status: r.status,
+              etag: r.headers.get('etag'),
+              rateRemaining: r.headers.get('x-ratelimit-remaining'),
+              rateReset: r.headers.get('x-ratelimit-reset'),
+              scopes: r.headers.get('x-oauth-scopes'),
+            };
+            if (r.status !== 200) return out;
+            return r.json().then(function (gist) {
+              out.gist = gist;
+              out.public = gist.public === true;
+              var text = readFile(gist, FILE_NAME);
+              if (!text) { out.missing = true; return out; }
+              try { out.data = JSON.parse(text); }
+              catch (e) { out.corrupt = true; }
+              return out;
+            });
+          });
+      },
+
+      push: function (cfg) {
+        var headers = ghHeaders(cfg.token, { 'Content-Type': 'application/json' });
+        if (cfg.etag) headers['If-Match'] = cfg.etag;
+        return fetch(API + '/gists/' + encodeURIComponent(cfg.gistId), {
+          method: 'PATCH',
+          headers: headers,
+          body: JSON.stringify({ description: GIST_DESC, files: buildFiles(cfg.data) }),
+        }).then(function (r) {
+          return r.json().catch(function () { return null; }).then(function (body) {
+            return { status: r.status, etag: r.headers.get('etag'), data: body };
+          });
+        });
+      },
+    };
+  }
+
+  /* transport 注入点：传对象即替换（uitest 用内存实现），传 null 回到真实实现 */
+  function setTransport(t) {
+    transport = t || createWebTransport();
+    return transport;
+  }
+
+  function getTransport() {
+    if (!transport) transport = createWebTransport();
+    return transport;
+  }
+
+  /* ---------------- 失败记账（禁止静默失败） ---------------- */
+
+  function noteError(m, kind, msg) {
+    var t = CORE.nowMs();
+    if (!m.failSince) m.failSince = t;
+    m.lastErr = { kind: kind, msg: String(msg || ''), at: t };
+  }
+  function noteOk(m) {
+    m.lastOkAt = U.nowStamp();
+    m.failSince = null;
+    m.lastErr = null;
+  }
+
+  /* ---------------- 一轮同步 ---------------- */
+
+  /**
+   * 完整一轮：算增量 → 拉远端 → 合并 → 推本地 → 确认 outbox。
+   * opts.silent 只影响提示，不影响行为。返回一个结果对象（绝不 reject）。
+   */
+  function tick(opts) {
+    opts = opts || {};
+    var s = state();
+    if (!s) return Promise.resolve({ ok: false, reason: 'no-state' });
+    var m = CORE.meta(s);
+    /* 唯一的闸门就是 syncMeta.enabled（= 用户要不要同步），外加「令牌与位置都配好了」。
+       ★ 曾经额外加过一个「本会话是否已 start」的运行闩，结果 ——
+       「关闭同步 → 打开同步 → 立刻点『立即同步』」这段窗口里 start() 还没走完，
+       门闩仍是关的，用户的手动同步被直接拒绝。多一个闸门并不更安全，
+       只会多一种不一致：enabled 才是权威，stop() 的职责只是清掉定时器。 */
+    if (!m.enabled || !m.token || !m.gistId) return Promise.resolve({ ok: false, reason: 'off' });
+    if (running) return Promise.resolve({ ok: false, reason: 'busy' });
+
+    running = true;
+    lastAttemptAt = CORE.nowMs();
+    var tr = getTransport();
+    var cfg = { token: m.token, gistId: m.gistId, etag: m.etag };
+
+    /* 本地有改动先算出来（幂等），保证这一轮推的是最新状态 */
+    if (!applyingRemote) { try { CORE.diffToOps(s, { noQueue: true }); } catch (e) { /* 忽略 */ } }
+
+    var result = { ok: false, pulled: 0, applied: 0, pushed: 0, deletions: 0 };
+
+    return Promise.resolve()
+      .then(function () { return tr.pull(cfg); })
+      .then(function (res) {
+        if (res.status === 304) return { unchanged: true, etag: res.etag };                 // 没变，零流量
+        if (res.status === 401) { noteError(m, 'auth', '令牌已失效或被删除'); throw mkStop('auth'); }
+        if (res.status === 403) {
+          var reset = U.n0(res.rateReset) * 1000;
+          noteError(m, 'rate', reset ? '触发 GitHub 限流，将于 ' + new Date(reset).toLocaleTimeString() + ' 后恢复'
+            : '没有权限访问该 Gist');
+          throw mkStop('rate');
+        }
+        if (res.status === 404) { noteError(m, 'missing', '云端 Gist 不存在或已被删除'); throw mkStop('missing'); }
+        if (res.status !== 200) { noteError(m, 'http', '读取失败（HTTP ' + res.status + '）'); throw mkStop('http'); }
+        if (res.public === true) {
+          noteError(m, 'public', '该 Gist 是公开的，请重建一个私有 Gist（公开的会被 GitHub 吊销令牌）');
+          throw mkStop('public');
+        }
+        if (res.corrupt) { noteError(m, 'corrupt', '云端数据格式无法解析，已跳过本轮'); throw mkStop('corrupt'); }
+        if (res.missing || !res.data) {
+          /* 空 Gist：用本机数据把它初始化出来 */
+          return { needSeed: true, etag: res.etag };
+        }
+        var remote = res.data;
+        if (U.n0(remote.version) === U.n0(m.version)) return { unchanged: true, etag: res.etag };
+        return { remote: remote, etag: res.etag };
+      })
+      .then(function (stepRes) {
+        if (!stepRes) return null;
+
+        if (stepRes.remote) {
+          /* 首次配对：按判定选 overwrite / merge；之后一律增量合并 */
+          var mode = m.everPaired ? 'merge' : firstMode(s);
+          applyingRemote = true;
+          try {
+            var r = CORE.mergeRemote(s, stepRes.remote, mode);
+            result.mode = mode;
+            result.applied = r.applied;
+            result.deletions = r.deleted;
+          } finally { applyingRemote = false; }
+          m.etag = stepRes.etag || m.etag;
+        } else if (stepRes.etag) {
+          m.etag = stepRes.etag;
+        }
+
+        /* ★ 推不推，只看「有没有待推送的增量」，与「pull 有没有变化」无关。
+           踩过：曾经在 304 / 版本相同时直接 return，于是「另一端先写了一次、
+           本机随后改了数据」这一轮就只拉不推 —— 本机的改动要等下一轮才出去，
+           表现就是「改完一分钟内对方看不到」。 */
+        var needPush = (m.outbox || []).length > 0 || stepRes.needSeed;
+        if (!needPush) { result.ok = true; result.unchanged = !!stepRes.unchanged; noteOk(m); return null; }
+
+        /* 推：把 outbox 作成新版本送上去。
+           ★ snapshot 必须【每次都带全量】：云端那份是全量 + 增量尾巴，
+             新设备只靠它就够。早先为了省流量在增量推送时写 snapshot:null，
+             结果云端文件里的全量段被抹掉 —— 新设备再也无法一次拉完。
+             几十 KB 的量级下，正确性远比省这点流量重要。 */
+        var next = CORE.buildRemote(s, { version: U.n0(m.version) });
+        var outboxLen = (m.outbox || []).length;
+
+        return pushWithRetry(s, m, next, tr, 0).then(function (pr) {
+          if (!pr.ok) throw mkStop(pr.reason || 'push');
+          /* ★ 只有确认成功才清 outbox —— 否则 crash 会丢增量 */
+          m.outbox = m.outbox.slice(outboxLen);
+          m.version = U.n0(next.version);
+          m.etag = pr.etag || m.etag;
+          result.pushed = outboxLen;
+          result.ok = true;
+          noteOk(m);
+          return null;
+        });
+      })
+      .then(function () {
+        running = false;
+        notify();
+        return result;
+      })
+      .catch(function (e) {
+        running = false;
+        var kind = e && e.__stop ? e.kind : 'net';
+        if (!e || !e.__stop) noteError(m, 'net', '网络不可用或请求超时');
+        notify();
+        return { ok: false, reason: kind, error: e };
+      });
+  }
+
+  function mkStop(kind) {
+    var e = new Error(kind);
+    e.__stop = true;
+    e.kind = kind;
+    return e;
+  }
+
+  function firstMode(s) {
+    var auto = CORE.firstSyncMode(s);
+    /* 首次同步时 'ask' 交给界面处理；自动路径下保守取 merge（宁可不覆盖） */
+    return auto === 'overwrite' ? 'overwrite' : 'merge';
+  }
+
+  function pushWithRetry(s, m, payload, tr, attempt) {
+    return tr.push({ token: m.token, gistId: m.gistId, etag: m.etag, data: payload }).then(function (res) {
+      if (res.status === 200 || res.status === 201) return { ok: true, etag: res.etag };
+      if (res.status === 412) {
+        /* 撞车：别人先写了。拉回合并再重试。
+           ★ 这里必须【无条件重取】（不带 If-None-Match）：若只用条件请求，
+             很可能得到 304，于是本地拿不到云端的最新 version 号，
+             重试时算出的版本又与云端撞车 → 死循环到重试上限。
+             代价是撞车时多一次全量下载，而撞车本来就是罕见事件。 */
+        if (attempt >= RETRY_MAX) { noteError(m, 'conflict', '写入冲突重试多次仍未成功'); return { ok: false, reason: 'conflict' }; }
+        return tr.pull({ token: m.token, gistId: m.gistId, force: true }).then(function (pr) {
+          if (pr.status === 200 && pr.data) {
+            applyingRemote = true;
+            try { CORE.mergeRemote(s, pr.data, 'merge'); } finally { applyingRemote = false; }
+            m.etag = pr.etag || m.etag;
+            m.version = U.n0(pr.data.version);
+          }
+          var again = CORE.buildRemote(s, { version: U.n0(m.version) });
+          return pushWithRetry(s, m, again, tr, attempt + 1);
+        });
+      }
+      if (res.status === 401) { noteError(m, 'auth', '令牌已失效或被删除'); return { ok: false, reason: 'auth' }; }
+      if (res.status === 403) { noteError(m, 'rate', '触发 GitHub 限流或权限不足'); return { ok: false, reason: 'rate' }; }
+      if (res.status === 404) { noteError(m, 'missing', '云端 Gist 不存在或已被删除'); return { ok: false, reason: 'missing' }; }
+      noteError(m, 'http', '写入失败（HTTP ' + res.status + '）');
+      return { ok: false, reason: 'http' };
+    }).catch(function (e) {
+      noteError(m, 'net', '网络不可用：' + (e && e.message ? e.message : '未知错误'));
+      return { ok: false, reason: 'net' };
+    });
+  }
+
+  /* ---------------- 定时器与生命周期 ---------------- */
+
+  function schedulePush() {
+    if (!isOn()) return;
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(function () {
+      pushTimer = null;
+      if (XJ.store && XJ.store.state && XJ.store.state.syncMeta && XJ.store.state.syncMeta.enabled) tick({ silent: true });
+    }, PUSH_DELAY_MS);
+  }
+
+  function start() {
+    stop();
+    var m = meta();
+    if (!m || !m.enabled || !m.token || !m.gistId) return false;
+    timer = setInterval(function () {
+      if (document.hidden) return;
+      tick({ silent: true });
+    }, POLL_MS);
+    return true;
+  }
+
+  /** 关闭同步：清掉定时器与防抖。★ 配合 syncMeta.enabled=false，此后【零外发】。 */
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; }
+    running = false;
+    return true;
+  }
+
+  /** 回前台：超过 VISIBLE_STALE_MS 没同步就立刻补一次（先对齐再画） */
+  function onVisible() {
+    if (!isOn()) return;
+    if (CORE.nowMs() - lastAttemptAt < VISIBLE_STALE_MS) return;
+    tick({ silent: true });
+  }
+
+  /** 页面要走了：尽力把 outbox 推出去（不保证完成，只做尝试） */
+  function flushNow() {
+    var s = state();
+    if (!s || !isOn()) return Promise.resolve({ ok: false, reason: 'off' });
+    try { CORE.diffToOps(s, { noQueue: true }); } catch (e) { /* 忽略 */ }
+    return tick({ silent: true });
+  }
+
+  /* ---------------- 配对：检测令牌 / 列出 Gist / 新建 ---------------- */
+
+  /** 检查令牌可用性，并如实返回它的权限（经典令牌会给出 X-OAuth-Scopes） */
+  function checkToken(token) {
+    var tr = getTransport();
+    return tr.whoami({ token: token }).then(function (res) {
+      if (res.status === 401) return { ok: false, reason: 'auth', msg: '令牌无效或已失效' };
+      if (res.status !== 200) return { ok: false, reason: 'http', msg: '连接 GitHub 失败（HTTP ' + res.status + '）' };
+      var scopes = res.scopes === null || res.scopes === undefined
+        ? null                                    // 细粒度令牌通常不返回该头 → 视为通过
+        : String(res.scopes);
+      var hasGist = scopes === null || scopes === '' || scopes.split(',').indexOf('gist') >= 0;
+      return {
+        ok: true,
+        login: (res.data && res.data.login) || '',
+        scopes: scopes,
+        hasGist: hasGist,
+        msg: hasGist ? '' : '这个令牌没有 gist 权限，请重新创建并勾上 gist',
+      };
+    }).catch(function () {
+      return { ok: false, reason: 'net', msg: '网络不可用，无法连接 GitHub' };
+    });
+  }
+
+  /** 列出「已经是同步用」的 Gist（靠描述与文件名识别，避免列出一堆无关的 Gist） */
+  function listSyncGists(token) {
+    var tr = getTransport();
+    return tr.listGists({ token: token }).then(function (res) {
+      if (res.status !== 200 || !Array.isArray(res.data)) {
+        return { ok: false, msg: '无法列出 Gist（HTTP ' + res.status + '）', items: [] };
+      }
+      var items = [];
+      res.data.forEach(function (g) {
+        if (!g || !g.id) return;
+        var isSync = (g.description === GIST_DESC) || (g.files && g.files[FILE_NAME]);
+        if (!isSync) return;
+        items.push({ id: g.id, description: g.description || '', updatedAt: g.updated_at || '' });
+      });
+      return { ok: true, items: items };
+    }).catch(function () { return { ok: false, msg: '网络不可用', items: [] }; });
+  }
+
+  /** 新建同步 Gist：★ 强制 public:false（公开 Gist 会被 GitHub 自动吊销令牌） */
+  function createSyncGist(token) {
+    var s = state();
+    if (!s) return Promise.resolve({ ok: false, msg: '状态未就绪' });
+    try { CORE.diffToOps(s, { noQueue: true }); } catch (e) { /* 忽略 */ }
+    var payload = CORE.buildRemote(s, {});
+    payload.tombstones = payload.tombstones || [];
+    var tr = getTransport();
+    return tr.createGist({ token: token, data: payload }).then(function (res) {
+      if (res.status !== 201 || !res.data || !res.data.id) {
+        return { ok: false, msg: '新建失败（HTTP ' + res.status + '）' };
+      }
+      return { ok: true, gistId: res.data.id, isPublic: res.data.public === true };
+    }).catch(function () { return { ok: false, msg: '网络不可用' }; });
+  }
+
+  return {
+    FILE_NAME: FILE_NAME,
+    GIST_DESC: GIST_DESC,
+    POLL_MS: POLL_MS,
+    setApiBase: setApiBase,
+    apiBase: function () { return API; },
+    attach: attach,
+    detach: detach,
+    beforeSave: beforeSave,
+    status: status,
+    onChange: onChange,
+    tick: tick,
+    start: start,
+    stop: stop,
+    onVisible: onVisible,
+    flushNow: flushNow,
+    schedulePush: schedulePush,
+    setTransport: setTransport,
+    getTransport: getTransport,
+    createMemoryTransport: createMemoryTransport,
+    createWebTransport: createWebTransport,
+    checkToken: checkToken,
+    listSyncGists: listSyncGists,
+    createSyncGist: createSyncGist,
+    readFile: readFile,
+    buildFiles: buildFiles,
+    isOn: isOn,
   };
 })();
 
@@ -10998,14 +12483,40 @@ XJ.views.mine = (function () {
     return html;
   }
 
+  /** 同步状态一行字。同步未加载（老构建）或缺状态时给安全的兜底，不抛错。 */
+  function syncStatusLine() {
+    var st = (XJ.sync && XJ.sync.status) ? XJ.sync.status() : null;
+    if (!st) return { on: false, text: '未开启 · 数据只留在本机' };
+    if (!st.enabled) return { on: false, text: '未开启 · 数据只留在本机' };
+    if (!st.paired) return { on: true, text: '已开启，但还没选好云端位置' };
+    if (st.lastErr) {
+      /* ★ 禁止静默失败：出问题就把原因摆在入口上，别让人以为一直在同步 */
+      return { on: true, text: '⚠ ' + (st.lastErr.msg || '上次同步失败') };
+    }
+    if (st.failSince && Date.now() - st.failSince > 3 * 86400000) {
+      return { on: true, text: '⚠ 已连续 3 天没能同步，点开看原因' };
+    }
+    var t = st.lastOkAt ? String(st.lastOkAt).slice(11, 16) : '';
+    var pending = st.pending ? ' · 待同步 ' + st.pending + ' 项' : '';
+    return { on: true, text: (t ? '已连接 · 上次同步 ' + t : '已连接 · 正在同步…') + pending };
+  }
+
   function renderData() {
     var st = XJ.store;
     var s = XJ.calc.summary(st.state, st.acc());
     var modeLabel = XJ.storage.modeLabel();
     var lastQuote = st.state.settings.lastQuoteAt;
+    var sy = syncStatusLine();
 
     var html = '<div class="card flush">' +
       '<div style="padding:14px 16px 10px"><div class="card-head" style="margin:0"><h2>数据管理</h2></div></div>';
+
+    /* 跨设备同步放在最前：它是「多台设备」这件事的主入口，比导入导出更常用 */
+    html += '<button class="list-row" data-act="openSync">' +
+      '<div class="row-main"><div class="row-t">🔗 跨设备同步' +
+      (sy.on ? '<span class="pill blue">已开启</span>' : '') + '</div>' +
+      '<div class="row-s">' + U.esc(sy.text) + '</div></div>' +
+      '<span class="chev">' + UI.icon('chevron', 16) + '</span></button>';
 
     html += '<button class="list-row" data-act="exportJson">' +
       '<div class="row-main"><div class="row-t">' + UI.icon('download', 17) + ' 导出全部数据（JSON）</div>' +
@@ -11081,7 +12592,9 @@ XJ.views.mine = (function () {
     html += '<div class="card">' +
       '<div class="card-head"><h2>关于</h2></div>' +
       '<div class="tiny" style="line-height:1.85">' +
-      '<b>息记复刻版</b> · 单文件 PWA，数据全部保存在你自己的浏览器里，不上传任何服务器。<br><br>' +
+      '<b>息记复刻版</b> · 单文件 PWA。数据默认全部保存在你自己的浏览器里，' +
+      '只在取行情与分红时访问公开接口；<b>可选的跨设备同步默认关闭</b>，' +
+      '开启后才会把你自己的数据存进你自己的一个 GitHub 私有 Gist。<br><br>' +
       '<b>只做记录</b>：本应用不提供股票买卖、不推荐标的、不提供任何投资建议或收益承诺。<br><br>' +
       '<b>数据来源</b>：行情来自腾讯财经公开接口，分红方案来自东方财富与天天基金公开接口，均为公开信息的整理，可能存在延迟或偏差，请以券商与交易所披露为准。<br><br>' +
       '<b>已知局限</b>：<br>' +
@@ -11089,7 +12602,7 @@ XJ.views.mine = (function () {
       '· 美股无公开可用的免费分红源，只提供行情、成本与盈亏，分红可在个股页手工补录<br>' +
       '· 分红统一按税前口径，未计入分红个税<br>' +
       '· 多币种以人民币折算为主口径；汇率缺失时按 1 折算<br>' +
-      '· 多设备同步依赖「导出 JSON → 在另一台设备导入」<br>' +
+      '· 多设备同步可选：默认关闭；开启后手机/平板/电脑在前台自动保持一致（同步期间数据存进你自己的 GitHub 私有 Gist）。不开则用「跨设备搬运」或 JSON 导出导入<br>' +
       '· 直接以 file:// 打开时浏览器不支持 Service Worker 与系统级推送' +
       '</div></div>';
     return html;
@@ -14934,12 +16447,22 @@ XJ.views.symbol = (function () {
   UI.on('clearData', function () {
     UI.confirm({
       title: '清空本地数据',
-      html: '将删除本机保存的<b>全部</b>账户、持仓、交易与分红记录，且无法恢复。<br><br>建议先「导出全部数据（JSON）」做备份。',
+      html: '将删除本机保存的<b>全部</b>账户、持仓、交易与分红记录，且无法恢复。<br><br>建议先「导出全部数据（JSON）」做备份。' +
+        (S.state.syncMeta && S.state.syncMeta.enabled
+          ? '<br><br><b>本机与云端已配对，其他设备的数据不受影响</b>；清空后下次同步会把云端的数据重新拉回来。'
+            + '若想彻底不再同步，请先到「跨设备同步」里关闭。'
+          : ''),
       confirmText: '我已备份，清空', danger: true,
     }).then(function (ok) {
       if (!ok) return;
+      /* ★ 同步连接信息（deviceId / token / gistId / 修订账本 / 墓碑）必须跨清空保留：
+         否则本机会丢掉「我已经配对过」和「远端每条长什么样」的记忆，
+         下一次同步会把云端已有的一切当成「本机新增」整份推回去，或者反过来当成删除。 */
+      var keepSync = S.state.syncMeta;
       XJ.storage.clear().then(function () {
-        S.init(M.ensureBootstrapped(M.defaultState()));
+        var fresh = M.ensureBootstrapped(M.defaultState());
+        if (keepSync && keepSync.enabled) fresh.syncMeta = keepSync;
+        S.init(fresh);
         S.ui.accountId = C.ALL;
         S.commitNow(null);
         UI.toast('已清空');
@@ -15132,6 +16655,265 @@ XJ.views.symbol = (function () {
   }
 
   UI.on('openTransfer', function () { showTransferSheet(); });
+  /* ---------------- 跨设备同步（GitHub Gist） ----------------
+   * 中转站是一个【私有 Gist】里的单个文件。所有同步语义在 src/sync-core.js（纯函数），
+   * 网络与编排在 src/sync.js。这里只负责界面与「立刻同步」这类用户动作。
+   *
+   * ★ 三条界面上的铁律：
+   *   ① 默认关闭。不打开开关，应用一个同步请求都不会发。
+   *   ② 令牌（= 同步钥匙）只存在本机，绝不写进 Gist、绝不进导出。
+   *   ③ 不静默失败：出错原因必须显式摆在状态区。
+   */
+  var syncLoaded = null;        // 已列出的 Gist 列表（null = 还没查过）
+  var syncBusy = false;         // 「立即同步」进行中（注意：不要用 syncing，那是行情同步的旗标）
+
+  function syncEnabledNow() {
+    return !!(S.state.syncMeta && S.state.syncMeta.enabled);
+  }
+
+  /** 同步是否可用：必须是有域名的 http(s) 页面。
+   *  直接双击 HTML（file://）时浏览器会按 file:// 分区存储、且 fetch 无稳定来源，
+   *  同步在这种形态下【不可能】工作 —— 这是浏览器硬限制，不是 bug。 */
+  function syncAvailable() {
+    try { return location.protocol === 'http:' || location.protocol === 'https:'; }
+    catch (e) { return false; }
+  }
+
+  function syncStateLine() {
+    var st = XJ.sync && XJ.sync.status ? XJ.sync.status() : null;
+    if (!st) return '同步模块未加载';
+    if (syncBusy) return '正在同步…';
+    if (st.lastErr) return st.lastErr.msg || '上次同步失败';
+    if (!st.lastOkAt) return '尚未同步过';
+    return '上次同步 ' + String(st.lastOkAt).slice(0, 16).replace('T', ' ');
+  }
+
+  function syncBodyHtml() {
+    var sm = S.state.syncMeta || {};
+
+    if (!syncAvailable()) {
+      return '<div class="tiny" style="line-height:1.85">' +
+        '<b>当前打开方式不支持跨设备同步。</b><br><br>' +
+        '你正在<strong>直接打开本地 HTML 文件</strong>（地址以 <code>file://</code> 开头）。' +
+        '浏览器在这种方式下不会给页面稳定的联网身份，因此无法同步 —— 这是浏览器的限制。<br><br>' +
+        '要同步，请把 <code>dist/pwa/</code> 部署到一个网址（GitHub Pages / Vercel / 对象存储都行），' +
+        '再用手机、平板、电脑打开那个网址。部署步骤见 <code>docs/部署指南.md</code>。<br><br>' +
+        '<strong>本地功能不受影响</strong>：记录、行情、分红都照常可用，只是不同步。' +
+        '</div>';
+    }
+
+    if (!sm.enabled) {
+      return '<div class="tiny" style="line-height:1.7;margin-bottom:14px">' +
+        '开启后，你在手机上加仓、减仓、删除记录，平板与电脑会在 <strong>1 分钟内</strong>自动变得一样。' +
+        '</div>' +
+        '<div class="card" style="box-shadow:none;background:var(--card-2);margin-bottom:14px;padding:12px 14px">' +
+        '<div class="tiny" style="line-height:1.8">' +
+        '<b>开启前请知悉</b><br>' +
+        '· 你的持仓、交易、分红记录会被<strong>明文</strong>保存在你自己的一个 GitHub 私有 Gist 里，' +
+        '不再只留在本机<br>' +
+        '· 同步钥匙是一个 GitHub 令牌，它<strong>只存在这台设备的本地存储</strong>，' +
+        '不会写进云端、也不会出现在任何导出文件里<br>' +
+        '· 只有你自己填进去的令牌能读那个 Gist；但请勿公开分享 Gist 链接<br>' +
+        '· 随时可以关闭，关闭后应用<strong>不会再发出任何同步请求</strong>' +
+        '</div></div>' +
+        '<button class="btn-block" data-act="syncEnable">我明白了，开启同步</button>';
+    }
+
+    /* ---- 已开启：配对与状态 ---- */
+    var html = '';
+    html += '<div class="card" style="box-shadow:none;background:var(--card-2);margin-bottom:14px;padding:12px 14px">' +
+      '<div class="kv" style="padding:4px 0"><span class="k">状态</span><span class="v">' +
+      U.esc(syncStateLine()) + '</span></div>' +
+      (sm.gistId
+        ? '<div class="kv" style="padding:4px 0"><span class="k">云端位置</span><span class="v" style="font-family:var(--mono);font-size:12px">' +
+          U.esc(String(sm.gistId).slice(0, 12)) + '…</span></div>'
+        : '') +
+      '<div class="kv" style="padding:4px 0"><span class="k">待同步改动</span><span class="v">' +
+      U.n0((sm.outbox || []).length) + ' 项</span></div>' +
+      '</div>';
+
+    if (sm.lastErr) {
+      html += '<div class="tiny" style="line-height:1.7;margin-bottom:12px;color:var(--down)">' +
+        '⚠ ' + U.esc(sm.lastErr.msg || '同步失败') +
+        (sm.lastErr.kind === 'auth'
+          ? '<br>令牌可能被删掉或已过期。请到 GitHub 重新生成一个（只勾 gist），再在下面重新填入。'
+          : sm.lastErr.kind === 'missing'
+            ? '<br>云端那份数据不在了。可以点「新建同步位置」重新开始。'
+            : '<br>这不会影响本机数据，联网后会自动继续。') +
+        '</div>';
+    }
+
+    /* 令牌 */
+    html += '<div class="field"><label>GitHub 令牌（同步钥匙）</label>' +
+      '<input type="password" data-k="syncToken" placeholder="' +
+      (sm.token ? '已保存，如需更换请重新粘贴' : '粘贴 ghp_… 开头的令牌') + '" autocomplete="off">' +
+      '<div class="tiny" style="margin-top:6px;line-height:1.7">' +
+      '还没有令牌？GitHub → 头像 → Settings → Developer settings → ' +
+      '<b>Personal access tokens → Tokens (classic)</b> → Generate new token (classic)，' +
+      '只勾 <b>gist</b>，Expiration 选 <b>No expiration</b>（这样一次弄好就不用再管）。' +
+      '</div></div>' +
+      '<button class="btn-block ghost" data-act="syncCheckToken">检测令牌并列出我的 Gist</button>';
+
+    if (syncLoaded) {
+      if (syncLoaded.length) {
+        html += '<div class="field" style="margin-top:14px"><label>选择要用的云端位置</label>' +
+          syncLoaded.map(function (g) {
+            return '<button class="btn-block ghost" data-act="syncPickGist" data-id="' + U.esc(g.id) + '">' +
+              U.esc(g.description || '（无描述）') + ' · ' + U.esc(String(g.id).slice(0, 8)) + '…</button>';
+          }).join('') + '</div>';
+      } else {
+        html += '<div class="tiny" style="margin-top:12px">这台设备上还没有同步用的 Gist，' +
+          '点下面新建一个（会建成<b>私有</b>的）。</div>';
+      }
+    }
+
+    html += '<button class="btn-block" style="margin-top:12px" data-act="syncCreateGist">新建同步位置</button>' +
+      '<button class="btn-block ghost" data-act="syncNow">立即同步</button>' +
+      '<button class="btn-block ghost" data-act="syncDisable">关闭同步</button>' +
+      '<div class="tiny" style="margin-top:12px;line-height:1.7">' +
+      '关闭同步不会删除任何数据：本机记录保留，云端那份也保留，随时可以再打开。' +
+      '</div>';
+
+    return html;
+  }
+
+  function openSyncSheet() {
+    UI.openSheet({
+      title: '跨设备同步',
+      html: '<div id="xj-sync-body">' + syncBodyHtml() + '</div>',
+    });
+  }
+
+  /** 只重画弹层内容，不关掉弹层（免得每次操作都要重新打开） */
+  function refreshSyncSheet() {
+    var box = document.getElementById('xj-sync-body');
+    if (!box) return;
+    box.innerHTML = syncBodyHtml();
+  }
+
+  /** 读取弹层里的令牌：留空表示「沿用已保存的那个」 */
+  function readTokenInput() {
+    var box = document.getElementById('xj-sync-body');
+    if (!box) return (S.state.syncMeta || {}).token || null;
+    var el = box.querySelector('[data-k="syncToken"]');
+    var v = el ? String(el.value || '').trim() : '';
+    if (!v) return (S.state.syncMeta || {}).token || null;
+    return v;
+  }
+
+  UI.on('openSync', function () { syncLoaded = null; openSyncSheet(); });
+
+  UI.on('syncEnable', function () {
+    S.commit(function (s) {
+      var m = XJ.syncCore.meta(s);
+      m.enabled = true;
+      /* 开启时把既有数据登记成底稿：这一步不产生任何 op，
+         否则首次落盘会把整份历史当成「本机新增」推上去。 */
+      XJ.syncCore.seedVersions(s);
+    });
+    XJ.sync.start();
+    refreshSyncSheet();
+    UI.toast('已开启同步' + (S.state.syncMeta.gistId ? '' : '，请先填令牌并选择云端位置'));
+  });
+
+  UI.on('syncCheckToken', function () {
+    var token = readTokenInput();
+    if (!token) return UI.toast('请先粘贴 GitHub 令牌');
+    UI.toast('正在检测…');
+    XJ.sync.checkToken(token).then(function (res) {
+      if (!res.ok) {
+        S.commit(function (s) { s.syncMeta.token = token; });
+        UI.toast(res.msg || '令牌检测失败');
+        refreshSyncSheet();
+        return null;
+      }
+      if (!res.hasGist) {
+        UI.toast(res.msg || '这个令牌没有 gist 权限');
+        refreshSyncSheet();
+        return null;
+      }
+      S.commit(function (s) { s.syncMeta.token = token; });
+      return XJ.sync.listSyncGists(token).then(function (ls) {
+        syncLoaded = (ls && ls.items) || [];
+        if (!res.login) { /* 细粒度令牌不返回登录名，忽略 */ }
+        UI.toast(syncLoaded.length ? ('找到 ' + syncLoaded.length + ' 个可用的云端位置')
+          : '令牌可用，但还没有同步用的 Gist，点「新建同步位置」');
+        refreshSyncSheet();
+        return null;
+      });
+    });
+  });
+
+  UI.on('syncPickGist', function (node) {
+    var id = node.getAttribute('data-id');
+    var token = readTokenInput();
+    if (!id || !token) return UI.toast('请先填好令牌');
+    S.commit(function (s) {
+      var m = XJ.syncCore.meta(s);
+      m.token = token;
+      m.gistId = id;
+      m.etag = null;
+      m.enabled = true;
+    });
+    /* 选完立刻对齐一次：让用户马上看到另一台设备的数据 */
+    UI.toast('正在对齐云端数据…');
+    XJ.sync.tick({ silent: true }).then(function (r) {
+      refreshSyncSheet();
+      UI.toast(r && r.ok ? '已连接到云端' : '已保存，但这次没能取到云端数据');
+    });
+    XJ.sync.start();
+  });
+
+  UI.on('syncCreateGist', function () {
+    var token = readTokenInput();
+    if (!token) return UI.toast('请先粘贴 GitHub 令牌');
+    UI.toast('正在创建…');
+    XJ.sync.checkToken(token).then(function (chk) {
+      if (!chk.ok) { UI.toast(chk.msg || '令牌不可用'); return null; }
+      return XJ.sync.createSyncGist(token).then(function (r) {
+        if (!r.ok) { UI.toast(r.msg || '创建失败'); return null; }
+        if (r.isPublic) {
+          UI.toast('警告：创建出来的是公开 Gist，请勿使用', 4000);
+          return null;
+        }
+        S.commit(function (s) {
+          var m = XJ.syncCore.meta(s);
+          m.token = token;
+          m.gistId = r.gistId;
+          m.etag = null;
+          m.enabled = true;
+        });
+        XJ.sync.start();
+        refreshSyncSheet();
+        UI.toast('已创建私有 Gist，其它设备填同一个令牌即可选到它');
+        return null;
+      });
+    });
+  });
+
+  UI.on('syncNow', function () {
+    if (syncBusy) return;
+    syncBusy = true;
+    refreshSyncSheet();
+    XJ.sync.flushNow().then(function (r) {
+      syncBusy = false;
+      refreshSyncSheet();
+      if (r && r.ok) UI.toast('同步完成');
+      else if (r && r.reason === 'off') UI.toast('同步未开启或未配对');
+      else UI.toast('这次没能同步，原因见上方状态');
+    });
+  });
+
+  UI.on('syncDisable', function () {
+    XJ.sync.stop();
+    S.commit(function (s) {
+      var m = XJ.syncCore.meta(s);
+      m.enabled = false;
+    });
+    refreshSyncSheet();
+    UI.toast('已关闭同步，本机数据与云端数据都保留');
+  });
+
   UI.on('xferSnapshots', function (node) { XFER_SNAPSHOTS = !!node.checked; });
   UI.on('xferLink', function () {
     XJ.transfer.encode(transferPayload()).then(function (enc) { showTransferOut(enc, true); });
@@ -15234,6 +17016,15 @@ XJ.views.symbol = (function () {
     mountShell();
     if (S.ui.tab === 'overview') { /* 默认 */ }
 
+    /* 回前台立即补拉（用户解锁手机打开应用时先对齐再画）；离开页面时尽力把改动推出去。
+       两个监听都只在同步开启时才真正干活，关闭状态下是空转。 */
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && XJ.sync && XJ.sync.onVisible) XJ.sync.onVisible();
+    });
+    window.addEventListener('pagehide', function () {
+      if (XJ.sync && XJ.sync.flushNow) XJ.sync.flushNow();
+    });
+
     XJ.storage.init().then(function (mode) {
       return XJ.storage.load();
     }).then(function (loaded) {
@@ -15249,6 +17040,9 @@ XJ.views.symbol = (function () {
       var dupFixed = 0;
       try { dupFixed = XJ.calc.dedupeDividends(state); } catch (e) { console.warn('[dedupe]', e); }
       S.init(state);
+      /* 跨设备同步：挂上「落盘前算出增量 op」的钩子。
+         同步【默认关闭】—— 没开开关时这里只会把既有数据登记进修订账本，不发任何请求。 */
+      if (XJ.sync && XJ.sync.attach) XJ.sync.attach();
       if (dupFixed) {
         XJ.storage.save(state);
         UI.toast('已合并 ' + dupFixed + ' 条重复的分红到账记录');
@@ -15258,18 +17052,33 @@ XJ.views.symbol = (function () {
       S.subscribe(render);
       injectManifest();
       registerSW();
-      render();
-      /* 从带 #xjimport= 的链接打开 → 询问是否导入 */
-      setTimeout(function () { checkImportHash(); }, 400);
-      /* 派息日弹窗：这里试一次（分红方案本地就有缓存，离线也能弹），
-         同步完成后再试一次兜底（首装 / 缓存过期时靠那次）。两次都幂等，不会重复弹。 */
-      setTimeout(maybeShowPayoutPopup, 600);
-      syncAll({ silent: true }).then(function () { maybeShowPayoutPopup(); });
-      setInterval(function () {
-        if (!document.hidden) syncAll({ silent: true });
-      }, Math.max(60000, U.n0(S.state.settings.quoteRefreshMs) || 60000));
-      setInterval(reminderTick, 60000);
-      reminderTick();
+
+      /* ---- 跨设备同步：首屏对齐 ----
+         已开启同步且配对过时，**先把云端对齐再画第一帧**，
+         否则用户会先看到旧数据、几百毫秒后再跳变一次。
+         失败/超时一律放行（这里只等最多 4 秒），绝不能让同步拖死启动。 */
+      var firstPaint = (syncEnabledNow() && XJ.sync.isOn && XJ.sync.isOn())
+        ? Promise.race([
+          XJ.sync.tick({ silent: true }),
+          new Promise(function (r) { setTimeout(r, 4000); }),
+        ]).catch(function () { return null; })
+        : Promise.resolve(null);
+
+      firstPaint.then(function () {
+        render();
+        XJ.sync.start();          // 关闭状态下 start() 直接返回 false，不会建定时器
+        /* 从带 #xjimport= 的链接打开 → 询问是否导入 */
+        setTimeout(function () { checkImportHash(); }, 400);
+        /* 派息日弹窗：这里试一次（分红方案本地就有缓存，离线也能弹），
+           同步完成后再试一次兜底（首装 / 缓存过期时靠那次）。两次都幂等，不会重复弹。 */
+        setTimeout(maybeShowPayoutPopup, 600);
+        syncAll({ silent: true }).then(function () { maybeShowPayoutPopup(); });
+        setInterval(function () {
+          if (!document.hidden) syncAll({ silent: true });
+        }, Math.max(60000, U.n0(S.state.settings.quoteRefreshMs) || 60000));
+        setInterval(reminderTick, 60000);
+        reminderTick();
+      });
     }).catch(function (e) {
       console.error('[boot]', e);
       var state = M.ensureBootstrapped(M.defaultState());
