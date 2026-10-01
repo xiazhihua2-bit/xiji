@@ -2279,6 +2279,18 @@ XJ.model = (function () {
         failSince: null,
         lastErr: null,
         everPaired: false,
+        installMode: null,
+        /* 配对密钥：本机随机生成，用于把口令/二维码里的载荷加密（见 sync-core 的 XJ2e）。
+           它与 token 同级敏感 —— 只在本机持久化，绝不进 Gist、绝不进导出。
+           没有它时口令回落明文（XJ1p），旧的安装链接也因此继续可用。 */
+        pairKey: null,
+        /* 一次性自愈标记：登录时发现「账本空但记录带修订戳」说明踩过
+           「本机存档被当成导入备份解析」的旧 bug，已重建账本。见 app.js healSyncLedger。 */
+        legacyHealed: false,
+        /* 一次性：刚换到新的云端位置，这一次拉取必须无条件当真（见 app.js resetRemoteMemory） */
+        forcePull: false,
+        /* 令牌自述的权限范围：只用于界面提示，绝不进云端、绝不进导出 */
+        tokenScopes: null,
         outbox: [],
         versions: {},
         tombstones: {},
@@ -2412,13 +2424,22 @@ XJ.model = (function () {
     }
 
     /* ---- v5 新增容器：跨设备同步元数据 ----
-       只补容器、不动数据。同步默认关闭；没开开关就只是多一个空对象。
-       ★ 这里绝不从「导入的 JSON」里读 syncMeta —— 换设备导入别人的备份时
-         不该把对方的同步连接信息带进来（token 会被误用）。 */
+       只补容器、不动数据。这里【绝不从「导入的 JSON」里读 syncMeta】——
+       换设备导入别人的备份时不该把对方的同步连接信息带进来（token 会被误用）。
+       ★ 但本机存档读取必须走 fromImport(raw, { keepSync: true })：
+         这个解析器同时也是「开机自加载」的入口，若在自加载时也把 syncMeta 丢掉，
+         就变成「每打开一次网页，同步开关、令牌、云端位置、设备身份、修订账本全被清空」，
+         而账本清空会让本机全部记录被当成新增反复重推 —— 云端因此越堆越大，
+         最终写入被 GitHub 拒绝（HTTP 400）。
+         踩过：两个入口共用一个函数、又用「不读 syncMeta」一条规则同时满足两边，
+         结果是必需的功能被当成安全策略执行掉了。 */
     if (!state.syncMeta || typeof state.syncMeta !== 'object') state.syncMeta = {};
     var sm = state.syncMeta;
     if (sm.enabled !== true) sm.enabled = false;
     if (sm.everPaired !== true) sm.everPaired = false;
+    if (sm.installMode !== 'merge' && sm.installMode !== 'overwrite') sm.installMode = null;
+    if (sm.legacyHealed !== true) sm.legacyHealed = false;
+    if (typeof sm.pairKey !== 'string') sm.pairKey = null;
     if (!Array.isArray(sm.outbox)) sm.outbox = [];
     if (!sm.versions || typeof sm.versions !== 'object') sm.versions = {};
     if (!sm.tombstones || typeof sm.tombstones !== 'object') sm.tombstones = {};
@@ -2530,8 +2551,51 @@ XJ.model = (function () {
     return {
       deviceId: null, enabled: false, token: null, gistId: null,
       version: 0, etag: null, lastOkAt: null, failSince: null, lastErr: null,
-      everPaired: false, installMode: null, outbox: [], versions: {}, tombstones: {},
+      everPaired: false, installMode: null, pairKey: null, legacyHealed: false,
+      tokenScopes: null,
+      outbox: [], versions: {}, tombstones: {},
     };
+  }
+
+  /** 只认这些字段：本机加载时用来还原同步状态。
+   *  ★ 白名单而不是「整份拷贝」：老版本可能留下已废弃的脏字段，
+   *    照单全收会把它们带回内存，再落盘扩散。
+   *  ★ tombstones 一律从空开始 —— 墓碑是「删除凭证」，
+   *    重建会误删云端数据；空墓碑只会让「合并」多留一条，方向是安全的。 */
+  var SYNC_META_KEYS = [
+    'deviceId', 'enabled', 'token', 'gistId', 'version', 'etag',
+    'lastOkAt', 'failSince', 'lastErr', 'everPaired', 'installMode',
+    'pairKey', 'legacyHealed', 'tokenScopes', 'forcePull', 'outbox', 'versions',
+  ];
+
+  /** 按白名单还原 syncMeta（本机自加载专用；导入别人的备份【绝不】走这里） */
+  function normalizeSyncMeta(raw) {
+    var out = emptySyncMeta();
+    var src = raw || {};
+    for (var i = 0; i < SYNC_META_KEYS.length; i++) {
+      var k = SYNC_META_KEYS[i];
+      if (src[k] === undefined) continue;
+      out[k] = src[k];
+    }
+    if (out.enabled !== true) out.enabled = false;
+    if (out.everPaired !== true) out.everPaired = false;
+    if (out.installMode !== 'merge' && out.installMode !== 'overwrite') out.installMode = null;
+    if (out.legacyHealed !== true) out.legacyHealed = false;
+    if (out.forcePull !== true) out.forcePull = false;
+    if (typeof out.pairKey !== 'string') out.pairKey = null;
+    /* ★ token / gistId 只做「去空白后是不是空」的判断，【不做长度或格式校验】。
+       踩过：这里原本要求非空字符串，但顺手写成「太短就当没有」的近似校验，
+       于是任何短令牌（测试用的假令牌、或将来 GitHub 改格式）会在启动时被清掉 ——
+       而 enabled 还留在 true，界面就变成「开关是开的、令牌没了」，同步静默停摆。
+       令牌的合法性交给 GitHub 去判断，本机只负责「原样保存、如实呈现」。 */
+    if (typeof out.token === 'string') { out.token = out.token.trim(); if (!out.token) out.token = null; }
+    else out.token = null;
+    if (typeof out.gistId === 'string') { out.gistId = out.gistId.trim(); if (!out.gistId) out.gistId = null; }
+    else out.gistId = null;
+    if (typeof out.deviceId !== 'string' || !out.deviceId) out.deviceId = null;
+    if (!Array.isArray(out.outbox)) out.outbox = [];
+    if (!out.versions || typeof out.versions !== 'object') out.versions = {};
+    return out;
   }
 
   function toExport(state, note) {
@@ -2573,9 +2637,12 @@ XJ.model = (function () {
     };
   }
 
-  /** 宽松导入：字段缺失用默认值兜底，未知字段忽略 */
-  function fromImport(raw) {
+  /** 宽松导入：字段缺失用默认值兜底，未知字段忽略。
+   *  ★ opts.keepSync === true 时保留 raw.syncMeta（按白名单还原）——
+   *    这是【本机存档自加载】专用；导入别人的备份必须走默认值（不带对方的令牌）。 */
+  function fromImport(raw, opts) {
     if (!raw || typeof raw !== 'object') throw new Error('文件内容不是有效的 JSON 对象');
+    var keepSync = !!(opts && opts.keepSync === true);
     var base = defaultState();
     var out = base;
 
@@ -2594,8 +2661,10 @@ XJ.model = (function () {
     if (raw.yieldHistory && typeof raw.yieldHistory === 'object') out.yieldHistory = raw.yieldHistory;
     if (raw.benchHistory && typeof raw.benchHistory === 'object') out.benchHistory = raw.benchHistory;
     /* minuteCache 刻意不在白名单内：导入后为 null，下次刷新行情时自动重建当天分时 */
-    /* syncMeta 也刻意不在白名单内：导入的备份不带同步连接信息，
-       out.syncMeta 保持 defaultState() 里的初始值（关闭 + 无 token）。 */
+    /* syncMeta 默认【不认】：导入的备份不带同步连接信息，
+       out.syncMeta 保持 defaultState() 里的初始值（关闭 + 无 token）。
+       只有本机存档自加载（opts.keepSync）才按白名单还原它。 */
+    out.syncMeta = keepSync ? normalizeSyncMeta(raw.syncMeta) : emptySyncMeta();
     if (raw.version) out.version = raw.version;
 
     return ensureBootstrapped(out);
@@ -3193,6 +3262,567 @@ XJ.transfer = (function () {
 })();
 
 
+/* ==================== src/qr.js ==================== */
+/* ==================== 二维码（QR Code）编码器 ====================
+ * 为什么自己写而不是引库：这是个「零依赖、单文件、离线可用」的 PWA ——
+ * 引一个二维码库进来就意味着多一个要维护、要审计、要跟版本的外部代码，
+ * 而我们需要的只是【byte 模式 + 1~10 版】这一小块。
+ *
+ * 用途只有一个：把「接入口令」显示成二维码，让新设备用相机扫一下就能接入，
+ * 不必手打或复制粘贴一长串字符。
+ *
+ * 实现口径与 ISO/IEC 18004 一致，并在 verify.mjs 里与一份独立实现
+ * （npm 自带的 qrcode-terminal → Kazuhiko Arase 的 QRCode）【逐位比对】——
+ * 所以这里不需要靠「看起来像二维码」来自证正确。
+ *
+ * 纯函数、不碰 DOM、不碰网络：matrix() 是唯一的核心，svg() 只是它的渲染。
+ */
+XJ.qr = (function () {
+  var U = XJ.util;
+
+  /* ---------------- GF(256) 有限域 ---------------- */
+  /* 生成多项式 0x11D 的指数/对数表。gexp 允许传入任意整数（按 255 取模循环），
+     这样多项式乘法里出现的负指数不需要额外判断。 */
+  var EXP = new Array(256);
+  var LOG = new Array(256);
+  (function () {
+    for (var i = 0; i < 8; i++) EXP[i] = 1 << i;
+    for (var j = 8; j < 256; j++) {
+      EXP[j] = EXP[j - 4] ^ EXP[j - 5] ^ EXP[j - 6] ^ EXP[j - 8];
+    }
+    for (var k = 0; k < 255; k++) LOG[EXP[k]] = k;
+  })();
+
+  function gexp(n) {
+    while (n < 0) n += 255;
+    while (n >= 255) n -= 255;
+    return EXP[n];
+  }
+  function glog(n) {
+    if (n < 1) return 0;          // 0 的对数无定义；调用点保证不会走到这里
+    return LOG[n];
+  }
+
+  /* ---------------- 纠错分块表（版本 1~10 × L/M/Q/H） ----------------
+   * 每行是 [块数, 该块总码字, 该块数据码字] 的重复序列。
+   * 顺序固定为 L、M、Q、H（与 errorCorrectLevel 的编号 1/0/3/2 无关，
+   * 所以查表时必须用下面的 ECC_ROW 做映射，不能直接拿编号当行号）。 */
+  var RS_BLOCK_TABLE = [
+    // 版本 1
+    [1, 26, 19], [1, 26, 16], [1, 26, 13], [1, 26, 9],
+    // 版本 2
+    [1, 44, 34], [1, 44, 28], [1, 44, 22], [1, 44, 16],
+    // 版本 3
+    [1, 70, 55], [1, 70, 44], [2, 35, 17], [2, 35, 13],
+    // 版本 4
+    [1, 100, 80], [2, 50, 32], [2, 50, 24], [4, 25, 9],
+    // 版本 5
+    [1, 134, 108], [2, 67, 43], [2, 33, 15, 2, 34, 16], [2, 33, 11, 2, 34, 12],
+    // 版本 6
+    [2, 86, 68], [4, 43, 27], [4, 43, 19], [4, 43, 15],
+    // 版本 7
+    [2, 98, 78], [4, 49, 31], [2, 32, 14, 4, 33, 15], [4, 39, 13, 1, 40, 14],
+    // 版本 8
+    [2, 121, 97], [2, 60, 38, 2, 61, 39], [4, 40, 18, 2, 41, 19], [4, 40, 14, 2, 41, 15],
+    // 版本 9
+    [2, 146, 116], [3, 58, 36, 2, 59, 37], [4, 36, 16, 4, 37, 17], [4, 36, 12, 4, 37, 13],
+    // 版本 10
+    [2, 86, 68, 2, 87, 69], [4, 69, 43, 1, 70, 44], [6, 43, 19, 2, 44, 20], [6, 43, 15, 2, 44, 16],
+  ];
+
+  /* 纠错级别 → 表内行号。★ 不能直接用 L=1/M=0/Q=3/H=2 当行号。 */
+  var ECC_ROW = { L: 0, M: 1, Q: 2, H: 3 };
+  var ECC_LEVEL = { L: 1, M: 0, Q: 3, H: 2 };
+  var MIN_VERSION = 1;
+  var MAX_VERSION = 10;
+
+  /** 对齐图形中心坐标（版本 1~10）。表来自标准，与版本 7 起的多组对齐点对应。 */
+  var ALIGN_TABLE = [
+    [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34],
+    [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50],
+  ];
+
+  /** 取某版本 + 级别的分块列表 */
+  function rsBlocks(version, ecc) {
+    var row = RS_BLOCK_TABLE[(version - 1) * 4 + ECC_ROW[ecc]];
+    if (!row) return null;
+    var out = [];
+    for (var i = 0; i + 2 < row.length + 1; i += 3) {
+      var count = row[i], total = row[i + 1], data = row[i + 2];
+      if (total === undefined || data === undefined) break;
+      for (var c = 0; c < count; c++) out.push({ total: total, data: data });
+    }
+    return out.length ? out : null;
+  }
+
+  /** 该版本 + 级别的数据码字总容量（字节） */
+  function capacity(version, ecc) {
+    var blocks = rsBlocks(version, ecc);
+    if (!blocks) return 0;
+    var n = 0;
+    for (var i = 0; i < blocks.length; i++) n += blocks[i].data;
+    return n;
+  }
+
+  /* ---------------- 位缓冲 ---------------- */
+  function BitBuffer() { this.bits = []; }
+  BitBuffer.prototype.put = function (num, len) {
+    for (var i = 0; i < len; i++) this.bits.push(((num >>> (len - i - 1)) & 1) === 1);
+    return this;
+  };
+  BitBuffer.prototype.length = function () { return this.bits.length; };
+  /** 补零到字节边界（只在「尾部补位」时用） */
+  BitBuffer.prototype.padToByte = function () {
+    while (this.bits.length % 8 !== 0) this.bits.push(false);
+    return this;
+  };
+  BitBuffer.prototype.toBytes = function () {
+    var out = [];
+    for (var i = 0; i < this.bits.length; i += 8) {
+      var b = 0;
+      for (var j = 0; j < 8; j++) b = (b << 1) | (this.bits[i + j] ? 1 : 0);
+      out.push(b);
+    }
+    return out;
+  };
+
+  /* ---------------- Reed–Solomon ---------------- */
+  /** 生成多项式：Π (x - α^i)，i = 0..ecLen-1（最高次在前） */
+  function generatorPoly(ecLen) {
+    var poly = [1];
+    for (var i = 0; i < ecLen; i++) {
+      var next = new Array(poly.length + 1);
+      for (var a = 0; a < next.length; a++) next[a] = 0;
+      for (var j = 0; j < poly.length; j++) {
+        next[j] ^= gexp(glog(poly[j]) + 0);
+        next[j + 1] ^= gexp(glog(poly[j]) + i);
+      }
+      poly = next;
+    }
+    return poly;
+  }
+
+  /** 多项式取余（GF(256)）：返回长度 ecLen 的余式。
+   *
+   *  ★★ 这里有两个必须同时成立的细节，任何一个写错都会「结构全对、扫出来是乱码」：
+   *
+   *  ① 被除数要补 ecLen 个 0，而且每次只消首项、【不改数组长度】。
+   *     曾经每轮 shift() 掉一个元素来「省事」，于是每轮少一项，
+   *     余式整体前移几个位置 —— 系数全对、位置全错。这种错最难发现。
+   *
+   *  ② factor 必须是【商的指数】，不是商的值。
+   *     正确形式：buf[i+j] ^= gen[j] * (buf[i] / gen[0])，即
+   *       factorExp = glog(buf[i]) - glog(gen[0])
+   *       buf[i+j] ^= gexp(glog(gen[j]) + factorExp)
+   *     曾经写成 gexp(glog(buf[i])) 当 factor —— 那是「值」，与 glog(gen[j]) 相加
+   *     属于两个不同域的量相加。因为 gen[0] 恒为 1（glog(1)=0）时首项恰好还能抵消，
+   *     所以单块的版本 1 二维码看起来完全正常，只有多块/长内容才暴露 ——
+   *     也就是说：肉眼看不出、单块也测不出。 */
+  function polyMod(data, gen) {
+    var gl = gen.length;
+    var ecLen = gl - 1;
+    var buf = data.slice();
+    for (var k = 0; k < ecLen; k++) buf.push(0);      // 相当于乘以 x^ecLen
+
+    var genLeadLog = glog(gen[0]);
+    for (var i = 0; i + gl <= buf.length; i++) {
+      var c = buf[i];
+      if (c === 0) continue;                         // 首项已是 0 就跳过（移位后出现 0 是正常的）
+      var factorExp = glog(c) - genLeadLog;          // ★ 指数域，别拿值来加
+      for (var j = 0; j < gl; j++) buf[i + j] ^= gexp(glog(gen[j]) + factorExp);
+    }
+    /* 余式 = 尾部 ecLen 项，且保证长度恰好 ecLen（不足前面补 0） */
+    var out = new Array(ecLen);
+    var offset = buf.length - ecLen;
+    for (var m = 0; m < ecLen; m++) {
+      var v = buf[offset + m];
+      out[m] = v === undefined ? 0 : v;
+    }
+    return out;
+  }
+
+  /** 数据码字 → 分块 → 加纠错 → 交错（最终码字序列） */
+  function buildCodewords(bytes, version, ecc) {
+    var blocks = rsBlocks(version, ecc);
+    if (!blocks) return null;
+
+    var dc = [], ec = [], maxDc = 0, maxEc = 0, offset = 0;
+    for (var r = 0; r < blocks.length; r++) {
+      var dcCount = blocks[r].data;
+      var ecCount = blocks[r].total - dcCount;
+      if (dcCount > maxDc) maxDc = dcCount;
+      if (ecCount > maxEc) maxEc = ecCount;
+      var data = [];
+      for (var i = 0; i < dcCount; i++) data.push((bytes[offset + i] || 0) & 0xff);
+      offset += dcCount;
+      /* ★ 直接传数据码字：补 ecLen 个 0 的那一步在 polyMod 内部完成。
+         以前这里先 concat 一串 0 再传，改成内部补零后若不统一，就会补两次。 */
+      ec.push(polyMod(data, generatorPoly(ecCount)));
+      dc.push(data);
+    }
+
+    var out = [];
+    for (var z = 0; z < maxDc; z++) {
+      for (var s = 0; s < blocks.length; s++) if (z < dc[s].length) out.push(dc[s][z]);
+    }
+    for (var y = 0; y < maxEc; y++) {
+      for (var t = 0; t < blocks.length; t++) if (y < ec[t].length) out.push(ec[t][y]);
+    }
+    return out;
+  }
+
+  /* ---------------- 掩码 ---------------- */
+  function maskAt(pattern, i, j) {
+    switch (pattern) {
+      case 0: return (i + j) % 2 === 0;
+      case 1: return i % 2 === 0;
+      case 2: return j % 3 === 0;
+      case 3: return (i + j) % 3 === 0;
+      case 4: return (Math.floor(i / 2) + Math.floor(j / 3)) % 2 === 0;
+      case 5: return (i * j) % 2 + (i * j) % 3 === 0;
+      case 6: return ((i * j) % 2 + (i * j) % 3) % 2 === 0;
+      case 7: return ((i * j) % 3 + (i + j) % 2) % 2 === 0;
+      default: return false;
+    }
+  }
+
+  /* ---------------- 格式信息（BCH 15,5） ---------------- */
+  var G15 = (1 << 10) | (1 << 8) | (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | (1 << 0);
+  var G15_MASK = (1 << 14) | (1 << 12) | (1 << 10) | (1 << 4) | (1 << 1);
+
+  function bchDigit(v) {
+    var d = 0;
+    var n = v >>> 0;
+    while (n !== 0) { d++; n >>>= 1; }
+    return d;
+  }
+
+  function formatBits(ecc, maskPattern) {
+    var data = (ECC_LEVEL[ecc] << 3) | maskPattern;
+    var d = data << 10;
+    while (bchDigit(d) - bchDigit(G15) >= 0) d ^= (G15 << (bchDigit(d) - bchDigit(G15)));
+    return ((data << 10) | d) ^ G15_MASK;
+  }
+
+  /* ---------------- 矩阵：骨架 ---------------- */
+  function blankMatrix(size) {
+    var m = new Array(size);
+    for (var r = 0; r < size; r++) {
+      m[r] = new Array(size);
+      for (var c = 0; c < size; c++) m[r][c] = null;   // null = 还没放东西
+    }
+    return m;
+  }
+
+  function placeFinder(m, size, row, col) {
+    for (var r = -1; r <= 7; r++) {
+      if (row + r < 0 || row + r >= size) continue;
+      for (var c = -1; c <= 7; c++) {
+        if (col + c < 0 || col + c >= size) continue;
+        var dark =
+          (r >= 0 && r <= 6 && (c === 0 || c === 6)) ||
+          (c >= 0 && c <= 6 && (r === 0 || r === 6)) ||
+          (r >= 2 && r <= 4 && c >= 2 && c <= 4);
+        m[row + r][col + c] = dark;
+      }
+    }
+  }
+
+  function placeTiming(m, size) {
+    for (var i = 8; i < size - 8; i++) {
+      if (m[i][6] === null) m[i][6] = i % 2 === 0;
+      if (m[6][i] === null) m[6][i] = i % 2 === 0;
+    }
+  }
+
+  function placeAlign(m, version) {
+    var pos = ALIGN_TABLE[version - 1] || [];
+    for (var i = 0; i < pos.length; i++) {
+      for (var j = 0; j < pos.length; j++) {
+        var row = pos[i], col = pos[j];
+        if (m[row][col] !== null) continue;              // 与定位图形重叠就跳过
+        for (var r = -2; r <= 2; r++) {
+          for (var c = -2; c <= 2; c++) {
+            m[row + r][col + c] = (r === -2 || r === 2 || c === -2 || c === 2 || (r === 0 && c === 0));
+          }
+        }
+      }
+    }
+  }
+
+  /** 版本 ≥7 要写 18 位版本信息 */
+  function placeVersionInfo(m, size, version) {
+    if (version < 7) return;
+    var d = version << 12;
+    var G18 = (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 5) | (1 << 2) | (1 << 0);
+    while (bchDigit(d) - bchDigit(G18) >= 0) d ^= (G18 << (bchDigit(d) - bchDigit(G18)));
+    var bits = (version << 12) | d;
+    for (var i = 0; i < 18; i++) {
+      var bit = ((bits >> i) & 1) === 1;
+      m[Math.floor(i / 3)][i % 3 + size - 8 - 3] = bit;
+      m[i % 3 + size - 8 - 3][Math.floor(i / 3)] = bit;
+    }
+  }
+
+  /** 格式信息：15 位，写两处（含固定的那个暗模块） */
+  function placeFormatInfo(m, size, ecc, maskPattern) {
+    var bits = formatBits(ecc, maskPattern);
+    for (var v = 0; v < 15; v++) {
+      var mod = ((bits >> v) & 1) === 1;
+      if (v < 6) m[v][8] = mod;
+      else if (v < 8) m[v + 1][8] = mod;
+      else m[size - 15 + v][8] = mod;
+    }
+    for (var h = 0; h < 15; h++) {
+      var mod2 = ((bits >> h) & 1) === 1;
+      if (h < 8) m[8][size - h - 1] = mod2;
+      else if (h < 9) m[8][15 - h - 1 + 1] = mod2;
+      else m[8][15 - h - 1] = mod2;
+    }
+    m[size - 8][8] = true;                                // 固定的暗模块
+  }
+
+  /** 按标准蛇形走位把码字铺进数据区 */
+  function mapData(m, size, codewords, maskPattern) {
+    var inc = -1;
+    var row = size - 1;
+    var bitIndex = 7;
+    var byteIndex = 0;
+    for (var col = size - 1; col > 0; col -= 2) {
+      if (col === 6) col--;                               // 跳过竖直时序线那一列
+      for (;;) {
+        for (var c = 0; c < 2; c++) {
+          if (m[row][col - c] !== null) continue;
+          var dark = false;
+          if (byteIndex < codewords.length) {
+            dark = ((codewords[byteIndex] >>> bitIndex) & 1) === 1;
+          }
+          if (maskAt(maskPattern, row, col - c)) dark = !dark;
+          m[row][col - c] = dark;
+          bitIndex--;
+          if (bitIndex === -1) { byteIndex++; bitIndex = 7; }
+        }
+        row += inc;
+        if (row < 0 || row >= size) { row -= inc; inc = -inc; break; }
+      }
+    }
+  }
+
+  /* ---------------- 罚分（选掩码用） ---------------- */
+  function penalty(m, size) {
+    var p = 0, row, col, r, c;
+
+    /* 规则 1：同色块 */
+    for (row = 0; row < size; row++) {
+      for (col = 0; col < size; col++) {
+        var same = 0, dark = m[row][col];
+        for (r = -1; r <= 1; r++) {
+          if (row + r < 0 || row + r >= size) continue;
+          for (c = -1; c <= 1; c++) {
+            if (col + c < 0 || col + c >= size) continue;
+            if (r === 0 && c === 0) continue;
+            if (dark === m[row + r][col + c]) same++;
+          }
+        }
+        if (same > 5) p += 3 + same - 5;
+      }
+    }
+
+    /* 规则 2：2×2 同色 */
+    for (row = 0; row < size - 1; row++) {
+      for (col = 0; col < size - 1; col++) {
+        var n = 0;
+        if (m[row][col]) n++;
+        if (m[row + 1][col]) n++;
+        if (m[row][col + 1]) n++;
+        if (m[row + 1][col + 1]) n++;
+        if (n === 0 || n === 4) p += 3;
+      }
+    }
+
+    /* 规则 3：1011101 形状（横竖各扫一遍） */
+    for (row = 0; row < size; row++) {
+      for (col = 0; col < size - 6; col++) {
+        if (m[row][col] && !m[row][col + 1] && m[row][col + 2] && m[row][col + 3] &&
+          m[row][col + 4] && !m[row][col + 5] && m[row][col + 6]) p += 40;
+      }
+    }
+    for (col = 0; col < size; col++) {
+      for (row = 0; row < size - 6; row++) {
+        if (m[row][col] && !m[row + 1][col] && m[row + 2][col] && m[row + 3][col] &&
+          m[row + 4][col] && !m[row + 5][col] && m[row + 6][col]) p += 40;
+      }
+    }
+
+    /* 规则 4：暗块比例偏离 50% */
+    var darkCount = 0;
+    for (row = 0; row < size; row++) for (col = 0; col < size; col++) if (m[row][col]) darkCount++;
+    var ratio = Math.abs(100 * darkCount / size / size - 50) / 5;
+    p += ratio * 10;
+    return p;
+  }
+
+  /* ---------------- 对外核心：文本 → 矩阵 ---------------- */
+  /**
+   * @param {string} text 要编码的文本
+   * @param {object} [opts] { ecc:'L'|'M'|'Q'|'H', version:number, mask:number }
+   * @returns {{size:number, modules:boolean[][], version:number, ecc:string, mask:number}|null}
+   *          任何不合法输入一律返回 null（绝不抛错）——
+   *          调用方（界面）据此回落到「复制口令」，而不是把页面弄崩。
+   */
+  function matrix(text, opts) {
+    opts = opts || {};
+    if (typeof text !== 'string' || !text.length) return null;
+    if (text.length > 2000) return null;                  // 远超 10 版容量，没必要试
+
+    /* ★ 字节编码复用 transfer 的实现：多层各写一份 UTF-8 编码器，
+       迟早会在代理对（emoji）上出现两种结果，而二维码只认其中一种。 */
+    var T = XJ.transfer || {};
+    if (typeof T.utf8Bytes !== 'function') return null;
+    var bytes = T.utf8Bytes(text);
+    if (!bytes || !bytes.length) return null;
+
+    /* 版本：给定就用给定的；否则从最小往上试。
+       ★ 8bit 模式下的长度字段：1~9 版 8 位，10 版起 16 位。
+         试的时候必须用【该版本】的长度位数，否则 9↔10 版边界会算错。 */
+    var wantVersion = U.n0(opts.version);
+    var eccList = opts.ecc ? [opts.ecc] : ['M', 'L'];     // 优先 M（更好扫），装不下再退 L
+    var version, useEcc = null;
+    if (wantVersion) {
+      if (wantVersion < MIN_VERSION || wantVersion > MAX_VERSION) return null;
+      useEcc = opts.ecc && ECC_ROW[opts.ecc] !== undefined ? opts.ecc : 'M';
+      if (bytes.length > capacity(wantVersion, useEcc)) return null;
+      version = wantVersion;
+    } else {
+      for (var ei = 0; ei < eccList.length && !version; ei++) {
+        var ecc = eccList[ei];
+        if (ECC_ROW[ecc] === undefined) continue;
+        for (var v = MIN_VERSION; v <= MAX_VERSION; v++) {
+          var lenBits = v < 10 ? 8 : 16;
+          if (4 + lenBits + bytes.length * 8 <= capacity(v, ecc) * 8) {
+            version = v; useEcc = ecc; break;
+          }
+        }
+      }
+      if (!version) return null;                          // 连 10 版 L 都装不下
+    }
+
+    var size = version * 4 + 17;
+
+    /* ---- 数据码字：模式(4) + 长度 + 内容 + 补位 + 填充字节 ---- */
+    var bb = new BitBuffer();
+    bb.put(4, 4);                                         // 0100 = 8bit byte 模式
+    bb.put(bytes.length, version < 10 ? 8 : 16);
+    for (var i = 0; i < bytes.length; i++) bb.put(bytes[i], 8);
+
+    var totalDataBytes = capacity(version, useEcc);
+    if (bb.length() > totalDataBytes * 8) return null;     // 理论上前面的试探已排除，双保险
+    bb.put(0, Math.min(4, totalDataBytes * 8 - bb.length()));   // 结束符（放得下才放）
+    bb.padToByte();
+    var pad = [0xEC, 0x11];
+    for (var p = 0; bb.length() < totalDataBytes * 8; p++) bb.put(pad[p % 2], 8);
+
+    var codewords = buildCodewords(bb.toBytes(), version, useEcc);
+    if (!codewords) return null;
+
+    /* ---- 先搭骨架，再按最优掩码铺数据 ---- */
+    function skeleton() {
+      var m = blankMatrix(size);
+      placeFinder(m, size, 0, 0);
+      placeFinder(m, size, size - 7, 0);
+      placeFinder(m, size, 0, size - 7);
+      placeAlign(m, version);
+      placeTiming(m, size);
+      placeVersionInfo(m, size, version);
+      return m;
+    }
+
+    var best = null, bestPenalty = Infinity;
+    var maskList = opts.mask === undefined || opts.mask === null
+      ? [0, 1, 2, 3, 4, 5, 6, 7]
+      : [U.n0(opts.mask)];
+    for (var mi = 0; mi < maskList.length; mi++) {
+      var m = skeleton();
+      mapData(m, size, codewords, maskList[mi]);
+      placeFormatInfo(m, size, useEcc, maskList[mi]);
+      var score = penalty(m, size);
+      if (score < bestPenalty) { bestPenalty = score; best = { m: m, mask: maskList[mi] }; }
+    }
+    if (!best) return null;
+
+    return {
+      size: size,
+      modules: best.m,
+      version: version,
+      ecc: useEcc,
+      mask: best.mask,
+      /* 数据码字（含补位与填充）：verify 用它和标准实现逐字节比对。
+         界面不读它 —— 但它让「二维码错了」这件事能被定位到具体字节，而不是只能靠扫。 */
+      dataWords: bb.toBytes(),
+    };
+  }
+
+  /* ---------------- 渲染：SVG ---------------- */
+  /**
+   * 把矩阵渲染成 SVG（不引 canvas，字体缩放都不失真，且能被 <img>/截图直接采用）。
+   * quiet 是静区模块数：标准要求 ≥4，默认 4 —— 扫描失败十有八九是静区被裁了。
+   */
+  function svg(text, opts) {
+    opts = opts || {};
+    var q = matrix(text, opts);
+    if (!q) return null;
+    var quiet = opts.quiet === undefined ? 4 : Math.max(0, U.n0(opts.quiet));
+    var unit = U.n0(opts.unit) || 1;                       // 每个模块几个单位
+    var full = q.size + quiet * 2;
+    var px = full * unit;
+
+    /* 把连续的黑模块合并成一条 <rect>：45×45 的码点会从两千多个矩形降到几百个，
+       在手机上显示二维码就不会卡。 */
+    var rects = [];
+    for (var r = 0; r < q.size; r++) {
+      var start = -1;
+      for (var c = 0; c <= q.size; c++) {
+        var dark = c < q.size && q.modules[r][c];
+        if (dark && start < 0) start = c;
+        else if (!dark && start >= 0) {
+          rects.push('<rect x="' + ((start + quiet) * unit) + '" y="' + ((r + quiet) * unit) +
+            '" width="' + ((c - start) * unit) + '" height="' + unit + '"/>');
+          start = -1;
+        }
+      }
+    }
+    var bg = opts.transparent
+      ? ''
+      : '<rect width="' + px + '" height="' + px + '" fill="#fff"/>';
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + px + ' ' + px +
+      '" width="' + px + '" height="' + px + '" shape-rendering="crispEdges">' +
+      bg + '<g fill="#000">' + rects.join('') + '</g></svg>';
+  }
+
+  return {
+    matrix: matrix,
+    svg: svg,
+    capacity: capacity,
+    MIN_VERSION: MIN_VERSION,
+    MAX_VERSION: MAX_VERSION,
+    /* 内部件：只给 verify.mjs 与标准实现逐项比对用（界面绝不调用）。
+       暴露它们是故意的 —— 否则「二维码对不对」只能靠肉眼扫，出了问题无法定位到哪一层。 */
+    _internals: {
+      generatorPoly: generatorPoly,
+      polyMod: polyMod,
+      buildCodewords: buildCodewords,
+      rsBlocks: rsBlocks,
+      capacity: capacity,
+      maskAt: maskAt,
+      penalty: penalty,
+      formatBits: formatBits,
+      gexp: gexp,
+      glog: glog,
+    },
+  };
+})();
+
+
 /* ==================== src/sync-core.js ==================== */
 /* ==================== 跨设备同步 · 纯逻辑内核 ====================
  * 这一层【只有纯函数】：不碰 DOM、不碰网络、不碰 storage。
@@ -3424,9 +4054,16 @@ XJ.syncCore = (function () {
     deviceId: null, enabled: false, token: null, gistId: null,
     version: 0, etag: null, lastOkAt: null,
     failSince: null, lastErr: null, everPaired: false,
+    /* 令牌自述的权限范围（GitHub 的 X-OAuth-Scopes）。只在本机记录、只用于界面提示，
+       绝不写进 Gist、绝不进导出 —— 它和令牌同级敏感。 */
+    tokenScopes: null,
     /* 由安装链接写入的「这台设备首次接入时用哪种方式对齐」，见 firstSyncMode。
        首轮同步成功后由 sync.js 清空，之后一律走 merge。 */
     installMode: null,
+    /* 一次性：刚换到一个新的云端位置，这一次拉取必须无条件当真。
+       见 app.js 的 resetRemoteMemory —— 新位置的 version 可能与本地归零后的 0 相同，
+       而「版本相同＝没变化」的短路会让整次拉取失效。合并后由 sync.js 清掉。 */
+    forcePull: false,
     outbox: [], versions: {}, tombstones: {},
   };
 
@@ -3442,7 +4079,10 @@ XJ.syncCore = (function () {
        ★ 这样 meta() 返回的对象始终有个确定的 installMode，
          不会让「老版本导入的 state」留下一个 undefined 的模糊状态。 */
     if (m.installMode !== 'merge' && m.installMode !== 'overwrite') m.installMode = null;
+    if (m.forcePull !== true) m.forcePull = false;
     if (m.version === undefined || m.version === null) m.version = 0;
+    if (m.tokenScopes !== null && m.tokenScopes !== undefined) m.tokenScopes = String(m.tokenScopes);
+    else m.tokenScopes = null;
     if (!m.deviceId) m.deviceId = U.uid('dev');
     return m;
   }
@@ -3579,6 +4219,57 @@ XJ.syncCore = (function () {
   /** 把既有数据「登记」进账本，但不产生任何 op（首次落盘 / 打开同步时用） */
   function seedVersions(state) {
     return diffToOps(state, { noQueue: true, seed: true }).ops.length;
+  }
+
+  /**
+   * 把本机【全部实体】作为 upsert 放进 outbox，下一次推送就会带上完整并集。
+   *
+   * 为什么需要它：增量的前提是「账本记得每条长什么样」。可一旦设备换到另一个
+   * 云端位置（或者账本曾经被清空过），账本对这份数据的记忆就与目标位置无关了 ——
+   * diffToOps 会认为「全都见过、没变化」，于是本机独有的记录【永远不会被推上去】。
+   * 表现就是「接了回来，两边却还是不一样」。
+   *
+   * ★ 只放 upsert、不放墓碑：墓碑要保留在各自那边，靠「删除必胜」在合并时生效。
+   *   这条路径如果顺手发墓碑，就会把「本机没有」当成「本机删了」，那是不可逆的伤害。
+   * ★ 同键去重：outbox 里可能已经有同一条的 op，重复入队只会让负载翻倍。
+   * ★ opts.keys 可以只挑一部分实体（切换位置时用来挑「云端还没有的那几条」）。
+   * ★ 增量为 0 时是空操作（返回 0），不产生任何流量。
+   *
+   * ★★ 调用时机很重要：必须在【合并之后】。合并之后账本里已经记下「云端有哪些」，
+   *    此时只补推云端没有的那几条，才是真正的并集。
+   *    如果先无条件全推、再合并，本机把已在云端的记录又推一遍，
+   *    每输一次版本号就涨一次 —— 那正是「重复增量把云端撑大、最后写入被拒」的老路。
+   */
+  function enqueueAll(state, opts) {
+    opts = opts || {};
+    var only = opts.keys && typeof opts.keys === 'object' ? opts.keys : null;
+    var m = meta(state);
+    var have = {};
+    for (var oi = 0; oi < m.outbox.length; oi++) {
+      var o = m.outbox[oi];
+      if (o && o.t && !o.d) have[vid(o.t, o.id)] = true;
+    }
+    var added = 0;
+    for (var ti = 0; ti < TYPES.length; ti++) {
+      var type = TYPES[ti];
+      var def = DEFS[type];
+      if (!def) continue;
+      var ids = def.all(state);
+      for (var ii = 0; ii < ids.length; ii++) {
+        var id = ids[ii];
+        var key = vid(type, id);
+        if (have[key]) continue;
+        if (only && !only[key]) continue;
+        var rec = def.get(state, id);
+        if (!rec || typeof rec !== 'object') continue;
+        var st = stampOf(rec) || makeStamp(1, toMs(rec.createdAt, 0), m.deviceId);
+        m.outbox.push({ t: type, id: id, s: makeStamp(st.rev, st.rt, st.rd), d: 0 });
+        have[key] = true;
+        added++;
+      }
+    }
+    gcTombstones(m);
+    return added;
   }
 
   /** 墓碑清单（推给远端用）：一条删除必须让新设备也知道「这条是被删了」，而不只是「没有」 */
@@ -3880,8 +4571,6 @@ XJ.syncCore = (function () {
 
     var all = [];
 
-    var all = [];
-
     /* 先灌墓碑：它决定了随后哪些记录会被拒绝（删除必胜） */
     var tombs = (remote && remote.tombstones) || [];
     for (var xi = 0; xi < tombs.length; xi++) {
@@ -4093,6 +4782,237 @@ XJ.syncCore = (function () {
     return String(base || '').split('#')[0] + INSTALL_KEY + enc;
   }
 
+  /* ---------------- 接入口令（带口令的加密载荷 XJ2e） ----------------
+   *
+   * 为什么要有这一层，而不是直接用明文 XJ1p：
+   *   口令与二维码会出现在**屏幕、截图、聊天记录**里。明文的话，任何人拿到那张图
+   *   都能 base64 解出令牌 —— 那等于把钥匙印在屏幕上。
+   *   XJ2e 把载荷用一次性密钥加密，令牌不再以明文形式出现在图片里。
+   *
+   * ★ 诚实说明：口令里【也带着密钥】（否则新设备无法解开）。所以这层加密
+   *   挡的是「被扫到/被看到明文令牌」，不是「拿到口令的人」——
+   *   拿到口令本来就等于拿到写权限，这一点在界面上必须如实写明。
+   *
+   * 格式：XJ2e.<base64url(12字节 nonce)>.<base64url(密钥 16 字节)>.<base64url(密文||tag)>
+   *   · AES-GCM 128 位；密钥随机生成，不依赖密码，避免引入 KDF 与用户密码
+   *   · 密文里是 JSON {v:1, t:令牌, g:位置}，与 XJ1p 的载荷同构
+   *   · 环境不支持 crypto.subtle（file:// 或老浏览器）→ 回落明文 XJ1p，
+   *     并在界面上如实标注「当前环境口令未加密」，而不是假装加密了
+   */
+  var PAIR_PREFIX = 'XJ2e.';
+  var PAIR_MAX = 1400;
+
+  /** 环境是否支持 AES-GCM（file:// 下 crypto.subtle 通常不存在） */
+  function hasSubtle() {
+    try {
+      return !!(typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.encrypt === 'function');
+    } catch (e) { return false; }
+  }
+
+  /** 生成一个新的配对密钥（128 位，32 位十六进制） */
+  function newPairKey() {
+    var bytes = new Uint8Array(16);
+    try {
+      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+        crypto.getRandomValues(bytes);
+      } else {
+        for (var i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+      }
+    } catch (e) {
+      for (var j = 0; j < bytes.length; j++) bytes[j] = Math.floor(Math.random() * 256);
+    }
+    var out = '';
+    for (var k = 0; k < bytes.length; k++) out += ('0' + bytes[k].toString(16)).slice(-2);
+    return out;
+  }
+
+  /** 十六进制密钥 → 字节数组（非法返回 null） */
+  function keyBytes(hex) {
+    var s = String(hex || '');
+    if (!/^[0-9a-f]{32}$/i.test(s)) return null;
+    var out = new Uint8Array(16);
+    for (var i = 0; i < 16; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+    return out;
+  }
+
+  /** 任意字节 → base64url。
+   *  ★ 这里【不能】借 transfer.utf8Bytes：那是「字符串 → UTF-8 字节」的编码器，
+   *    而这些已经是原始字节了。套上去会把 ≥0x80 的字节再编一次成两字节，
+   *    nonce 从 12 字节涨到 18 字节，解密时必然认证失败
+   *    （表现为「口令解不开」，但编码那一侧看起来完全正常 —— 极难往回追）。
+   *    正确做法是走 transfer 的 b64url（它本来就是收「字节数组」的）。 */
+  function bytesToB64url(bytes) {
+    var arr = [];
+    for (var i = 0; i < bytes.length; i++) arr.push(bytes[i] & 0xff);
+    var T = XJ.transfer || {};
+    if (typeof T.b64url === 'function') return T.b64url(arr);
+    var s = '';
+    for (var j = 0; j < arr.length; j++) s += String.fromCharCode(arr[j]);
+    try { return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); } catch (e) { return null; }
+  }
+
+  /** base64url → 字节数组（一律返回真正的 Uint8Array：WebCrypto 只收 ArrayBufferView） */
+  function b64urlToBytes(s) {
+    var T = XJ.transfer || {};
+    var raw = null;
+    if (typeof T.unb64url === 'function') {
+      try { raw = T.unb64url(String(s)); } catch (e) { raw = null; }
+    }
+    if (!raw || !raw.length) {
+      try {
+        var bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
+        raw = [];
+        for (var i = 0; i < bin.length; i++) raw.push(bin.charCodeAt(i));
+      } catch (e2) { return null; }
+    }
+    var out = new Uint8Array(raw.length);
+    for (var k = 0; k < raw.length; k++) out[k] = raw[k] & 0xff;
+    return out;
+  }
+
+  /** 把令牌与位置编成口令。环境不支持加密时回落明文（返回值里的 plain 标注了这件事）。 */
+  function encodePairCode(cfg) {
+    var c = cfg || {};
+    var plain = encodeInstall({ token: c.token, gistId: c.gistId });
+    if (!plain) return Promise.resolve(null);
+    if (!hasSubtle()) return Promise.resolve({ code: plain, plain: true });
+
+    var kb = keyBytes(c.key);
+    if (!kb) return Promise.resolve({ code: plain, plain: true });
+
+    var nonce = new Uint8Array(12);
+    try {
+      if (crypto.getRandomValues) crypto.getRandomValues(nonce);
+      else for (var i = 0; i < 12; i++) nonce[i] = Math.floor(Math.random() * 256);
+    } catch (e) { for (var j = 0; j < 12; j++) nonce[j] = Math.floor(Math.random() * 256); }
+
+    var payload = (XJ.transfer && XJ.transfer.utf8Bytes)
+      ? XJ.transfer.utf8Bytes(JSON.stringify({ v: 1, t: String(c.token || '').trim(), g: String(c.gistId || '').trim() }))
+      : null;
+    if (!payload) return Promise.resolve({ code: plain, plain: true });
+    var data = new Uint8Array(payload);
+
+    return crypto.subtle.importKey('raw', kb, { name: 'AES-GCM' }, false, ['encrypt'])
+      .then(function (key) { return crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, data); })
+      .then(function (buf) {
+        var ct = new Uint8Array(buf);
+        var code = PAIR_PREFIX + bytesToB64url(nonce) + '.' + bytesToB64url(kb) + '.' + bytesToB64url(ct);
+        if (!code || code.length > PAIR_MAX) return { code: plain, plain: true };
+        return { code: code, plain: false };
+      })
+      .catch(function () { return { code: plain, plain: true }; });
+  }
+
+  /**
+   * 口令 → 配对信息。任何不合法一律 { ok:false }，绝不抛错。
+   * @returns Promise<{ok:true, token, gistId, plain:boolean, key:string|null}
+   *                  | {ok:false, reason:'format'|'crypto'|'no-crypto'|'bad-key'}>
+   */
+  function decodePairCode(code) {
+    var s = String(code === undefined || code === null ? '' : code).trim();
+    if (!s || s.length > PAIR_MAX) return Promise.resolve({ ok: false, reason: 'format' });
+
+    /* 明文（旧安装链接 / 不支持加密的环境）：直接复用既有解码器 */
+    if (s.indexOf(INSTALL_PREFIX) === 0) {
+      var old = decodeInstall(s);
+      return Promise.resolve(old
+        ? { ok: true, token: old.token, gistId: old.gistId, plain: true, key: null }
+        : { ok: false, reason: 'format' });
+    }
+
+    if (s.indexOf(PAIR_PREFIX) !== 0) return Promise.resolve({ ok: false, reason: 'format' });
+    var parts = s.slice(PAIR_PREFIX.length).split('.');
+    if (parts.length !== 3) return Promise.resolve({ ok: false, reason: 'format' });
+    if (!hasSubtle()) return Promise.resolve({ ok: false, reason: 'no-crypto' });
+
+    var nonce = b64urlToBytes(parts[0]);
+    var kb = b64urlToBytes(parts[1]);
+    var ct = b64urlToBytes(parts[2]);
+    if (!nonce || nonce.length !== 12 || !kb || kb.length !== 16 || !ct || !ct.length) {
+      return Promise.resolve({ ok: false, reason: 'format' });
+    }
+
+    return crypto.subtle.importKey('raw', kb, { name: 'AES-GCM' }, false, ['decrypt'])
+      .then(function (key) { return crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, ct); })
+      .then(function (buf) {
+        var text = (XJ.transfer && XJ.transfer.bytesUtf8)
+          ? XJ.transfer.bytesUtf8(Array.prototype.slice.call(new Uint8Array(buf)))
+          : null;
+        if (!text) return { ok: false, reason: 'crypto' };
+        var o = null;
+        try { o = JSON.parse(text); } catch (e) { return { ok: false, reason: 'crypto' }; }
+        if (!o || o.v !== 1) return { ok: false, reason: 'crypto' };
+        /* 复用编码侧的校验：能解出来的必能重新编回明文形式 */
+        if (!encodeInstall({ token: o.t, gistId: o.g })) return { ok: false, reason: 'crypto' };
+        var hex = '';
+        for (var i = 0; i < kb.length; i++) hex += ('0' + kb[i].toString(16)).slice(-2);
+        return { ok: true, token: String(o.t).trim(), gistId: String(o.g).trim(), plain: false, key: hex };
+      })
+      .catch(function () { return { ok: false, reason: 'bad-key' }; });
+  }
+
+  /** 从一段文本里找出口令（容忍前后文字、换行、全角、零宽、完整链接）。纯函数，无异步。 */
+  function parsePairText(raw) {
+    var s = String(raw === undefined || raw === null ? '' : raw);
+    if (!s) return null;
+    /* ① 去掉零宽与不可见字符：从聊天软件复制出来常带这些，肉眼完全看不出来 */
+    s = s.replace(/[\u200b-\u200f\u2028\u2029\ufeff]/g, '');
+    /* ② 全角 → 半角：输入法把口令变成全角是最常见的「看起来一模一样但不能用」 */
+    s = s.replace(/[\uff01-\uff5e]/g, function (ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xfee0); })
+      .replace(/\u3000/g, ' ');
+    /* ③ 编成一个字符都不带空白的版本：口令本身不含空白，所以「去掉全部空白」是无损的。
+       ★ 这一步必须放在切词【之前】—— 聊天软件常把长口令按行折断，
+         先按空白切的话只会切到第一行，用户看到的是「口令格式不对」，
+         而真正的原因是他复制的那段被换行拆开了。 */
+    var flat = s.replace(/\s+/g, '');
+    var at0 = flat.indexOf(INSTALL_PREFIX);
+    var at1 = flat.indexOf(PAIR_PREFIX);
+    var start = at0 >= 0 ? at0 : at1;
+    if (start >= 0 && start + 8 <= flat.length) return cutCode(flat.slice(start));
+    /* ④ 没找到前缀：也许整段就是口令（下面按行切词兜住带引号/标点的情形） */
+    var t = s.trim();
+    if (t.indexOf(INSTALL_PREFIX) === 0 || t.indexOf(PAIR_PREFIX) === 0) return cutCode(t);
+    /* ⑤ 完整链接 / 带 #xjsync= 的片段：取键之后到空白或引号之前那一段 */
+    var idx = s.indexOf(INSTALL_KEY);
+    if (idx >= 0) {
+      var rest = s.slice(idx + INSTALL_KEY.length);
+      var m = rest.match(/[^\s"'<>）)】]+/);
+      if (m) return cutCode(m[0]);
+    }
+    return null;
+  }
+
+  /** 把口令尾巴上粘着的标点切掉（微信里复制常带句号/逗号） */
+  function cutCode(s) {
+    var out = String(s || '').trim();
+    /* 只允许 base64url 与分隔点：遇到别的字符就截断 */
+    var m = out.match(/^[A-Za-z0-9._-]+/);
+    if (!m) return null;
+    out = m[0].replace(/[.]+$/, '');
+    if (out.length < 8) return null;
+    return out;
+  }
+
+  /** 从口令里取回配对密钥（明文口令返回 null） */
+  function pairKeyOf(code) {
+    var s = String(code || '');
+    if (s.indexOf(PAIR_PREFIX) !== 0) return null;
+    var parts = s.slice(PAIR_PREFIX.length).split('.');
+    if (parts.length !== 3) return null;
+    var kb = b64urlToBytes(parts[1]);
+    if (!kb || kb.length !== 16) return null;
+    var hex = '';
+    for (var i = 0; i < kb.length; i++) hex += ('0' + kb[i].toString(16)).slice(-2);
+    return hex;
+  }
+
+  /** 保证 state 上有一个配对密钥（没有就生成并写回）。返回密钥。 */
+  function ensurePairKey(state) {
+    var m = meta(state);
+    if (!/^[0-9a-f]{32}$/i.test(String(m.pairKey || ''))) m.pairKey = newPairKey();
+    return m.pairKey;
+  }
+
   /* ---------------- 状态自述（给界面用） ---------------- */
 
   function status(state) {
@@ -4108,6 +5028,9 @@ XJ.syncCore = (function () {
       lastErr: m.lastErr || null,
       deviceId: m.deviceId,
       everPaired: m.everPaired === true,
+      tokenScopes: m.tokenScopes || null,
+      legacyHealed: m.legacyHealed === true,
+      installMode: m.installMode || null,
       tombstoneCount: Object.keys(m.tombstones || {}).length,
     };
   }
@@ -4146,6 +5069,17 @@ XJ.syncCore = (function () {
     readInstallHash: readInstallHash,
     clearInstallHash: clearInstallHash,
     buildInstallUrl: buildInstallUrl,
+    /* 接入口令（加密载荷 XJ2e）与容错解析 */
+    PAIR_PREFIX: PAIR_PREFIX,
+    hasSubtle: hasSubtle,
+    newPairKey: newPairKey,
+    encodePairCode: encodePairCode,
+    decodePairCode: decodePairCode,
+    parsePairText: parsePairText,
+    pairKeyOf: pairKeyOf,
+    ensurePairKey: ensurePairKey,
+    /* 切换云端位置 / 重来一次：把本机全部实体作为待推送项（保证并集） */
+    enqueueAll: enqueueAll,
     gcTombstones: gcTombstones,
     status: status,
     nowMs: nowMs,
@@ -4400,7 +5334,14 @@ XJ.sync = (function () {
               rateReset: r.headers.get('x-ratelimit-reset'),
               scopes: r.headers.get('x-oauth-scopes'),
             };
-            if (r.status !== 200) return out;
+            if (r.status !== 200) {
+              /* ★ 失败时也要把 GitHub 的原话带回去：界面上要显示它说了什么，
+                 而不是我们自己猜的原因（400 就是个只有 GitHub 才知道为什么的码）。 */
+              return r.json().catch(function () { return null; }).then(function (body) {
+                out.data = body;
+                return out;
+              });
+            }
             return r.json().then(function (gist) {
               out.gist = gist;
               out.public = gist.public === true;
@@ -4422,7 +5363,13 @@ XJ.sync = (function () {
           body: JSON.stringify({ description: GIST_DESC, files: buildFiles(cfg.data) }),
         }).then(function (r) {
           return r.json().catch(function () { return null; }).then(function (body) {
-            return { status: r.status, etag: r.headers.get('etag'), data: body };
+            return {
+              status: r.status,
+              etag: r.headers.get('etag'),
+              scopes: r.headers.get('x-oauth-scopes'),
+              rateRemaining: r.headers.get('x-ratelimit-remaining'),
+              data: body,
+            };
           });
         });
       },
@@ -4442,10 +5389,56 @@ XJ.sync = (function () {
 
   /* ---------------- 失败记账（禁止静默失败） ---------------- */
 
+  /**
+   * 从 GitHub 的错误响应里抠出「它到底说了什么」。
+   *
+   * ★ 为什么要这么较真：过去 HTTP 400 只会显示「写入失败（HTTP 400）」，
+   *   然后被归到「联网后会自动继续」那一类。可 400 是【请求被拒】——
+   *   联网永远不会自动变好，用户只会一直等一个不会发生的自愈。
+   *   把 GitHub 的原话（message / errors[] / 文档链接）显示出来，才谈得上「禁止静默失败」。
+   */
+  function ghErrorText(res) {
+    var out = [];
+    var body = res && res.data;
+    if (typeof body === 'string' && body) {
+      out.push(body.replace(/\s+/g, ' ').slice(0, 200));
+    } else if (body && typeof body === 'object') {
+      if (body.message) out.push(String(body.message));
+      if (Array.isArray(body.errors)) {
+        var parts = [];
+        for (var i = 0; i < body.errors.length && i < 3; i++) {
+          var e = body.errors[i];
+          if (typeof e === 'string') parts.push(e);
+          else if (e && typeof e === 'object') {
+            parts.push([e.resource, e.field, e.code].filter(Boolean).join('/') +
+              (e.message ? '：' + e.message : ''));
+          }
+        }
+        if (parts.length) out.push(parts.join('；'));
+      }
+    }
+    return out.join(' — ').slice(0, 300);
+  }
+
+  /** 组装一条可读的失败信息：HTTP 码 + GitHub 原话 + 令牌权限（有则带上） */
+  function httpFailMsg(prefix, res) {
+    var msg = prefix + '（HTTP ' + (res && res.status) + '）';
+    var detail = ghErrorText(res);
+    if (detail) msg += '：' + detail;
+    if (res && res.scopes) msg += ' · 令牌权限：' + res.scopes;
+    else if (res && res.scopes === '') msg += ' · 令牌权限：（未返回，通常是细粒度令牌）';
+    return msg;
+  }
+
   function noteError(m, kind, msg) {
     var t = CORE.nowMs();
     if (!m.failSince) m.failSince = t;
     m.lastErr = { kind: kind, msg: String(msg || ''), at: t };
+  }
+  /** 记下令牌自述的权限范围（面板要用；绝不外发、也不进云端） */
+  function noteScopes(m, scopes) {
+    if (scopes === undefined || scopes === null) return;
+    m.tokenScopes = String(scopes);
   }
   function noteOk(m) {
     m.lastOkAt = U.nowStamp();
@@ -4458,8 +5451,13 @@ XJ.sync = (function () {
   /**
    * 完整一轮：算增量 → 拉远端 → 合并 → 推本地 → 确认 outbox。
    * opts.silent 只影响提示，不影响行为。返回一个结果对象（绝不 reject）。
+   * ★ 串行：同一时刻只有一轮在跑；来晚的排队，不丢。
    */
   function tick(opts) {
+    return enqueue(function () { return doTick(opts); });
+  }
+
+  function doTick(opts) {
     opts = opts || {};
     var s = state();
     if (!s) return Promise.resolve({ ok: false, reason: 'no-state' });
@@ -4470,7 +5468,6 @@ XJ.sync = (function () {
        门闩仍是关的，用户的手动同步被直接拒绝。多一个闸门并不更安全，
        只会多一种不一致：enabled 才是权威，stop() 的职责只是清掉定时器。 */
     if (!m.enabled || !m.token || !m.gistId) return Promise.resolve({ ok: false, reason: 'off' });
-    if (running) return Promise.resolve({ ok: false, reason: 'busy' });
 
     running = true;
     lastAttemptAt = CORE.nowMs();
@@ -4485,27 +5482,41 @@ XJ.sync = (function () {
     return Promise.resolve()
       .then(function () { return tr.pull(cfg); })
       .then(function (res) {
+        if (res.scopes !== undefined && res.scopes !== null) noteScopes(m, res.scopes);
         if (res.status === 304) return { unchanged: true, etag: res.etag };                 // 没变，零流量
-        if (res.status === 401) { noteError(m, 'auth', '令牌已失效或被删除'); throw mkStop('auth'); }
+        if (res.status === 401) {
+          noteError(m, 'auth', '令牌已失效或被删除（GitHub：' + (ghErrorText(res) || '未通过认证') + '）');
+          throw mkStop('auth');
+        }
         if (res.status === 403) {
           var reset = U.n0(res.rateReset) * 1000;
-          noteError(m, 'rate', reset ? '触发 GitHub 限流，将于 ' + new Date(reset).toLocaleTimeString() + ' 后恢复'
-            : '没有权限访问该 Gist');
+          noteError(m, 'rate', reset
+            ? '触发 GitHub 限流，将于 ' + new Date(reset).toLocaleTimeString() + ' 后恢复'
+            : httpFailMsg('没有权限访问这个云端位置', res));
           throw mkStop('rate');
         }
-        if (res.status === 404) { noteError(m, 'missing', '云端 Gist 不存在或已被删除'); throw mkStop('missing'); }
-        if (res.status !== 200) { noteError(m, 'http', '读取失败（HTTP ' + res.status + '）'); throw mkStop('http'); }
+        if (res.status === 404) {
+          noteError(m, 'missing', '云端位置不存在或已被删除（HTTP 404）。可以点「新建同步位置」重新开始');
+          throw mkStop('missing');
+        }
+        if (res.status !== 200) { noteError(m, 'http', httpFailMsg('读取失败', res)); throw mkStop('http'); }
         if (res.public === true) {
           noteError(m, 'public', '该 Gist 是公开的，请重建一个私有 Gist（公开的会被 GitHub 吊销令牌）');
           throw mkStop('public');
         }
         if (res.corrupt) { noteError(m, 'corrupt', '云端数据格式无法解析，已跳过本轮'); throw mkStop('corrupt'); }
         if (res.missing || !res.data) {
-          /* 空 Gist：用本机数据把它初始化出来 */
+          /* 空位置：用本机数据把它初始化出来 */
+          m.forcePull = false;
           return { needSeed: true, etag: res.etag };
         }
         var remote = res.data;
-        if (U.n0(remote.version) === U.n0(m.version)) return { unchanged: true, etag: res.etag };
+        /* ★ forcePull 是「刚换到一个新位置」的一次性放行：
+           新位置的 version 与本地刚被重置的 0 会恰好相同，若不放行，
+           下面这句「版本相同就当没变化」会把整次拉取短路掉 ——
+           不合并、不更新 etag、不登记账本，表现为「接了回来却什么都没同步」。
+           这个标记由 resetRemoteMemory 设置，合并完成后清掉。 */
+        if (!m.forcePull && U.n0(remote.version) === U.n0(m.version)) return { unchanged: true, etag: res.etag };
         return { remote: remote, etag: res.etag };
       })
       .then(function (stepRes) {
@@ -4522,8 +5533,11 @@ XJ.sync = (function () {
             result.deletions = r.deleted;
           } finally { applyingRemote = false; }
           m.etag = stepRes.etag || m.etag;
+          m.forcePull = false;                 // 一次性放行用完即清
         } else if (stepRes.etag) {
           m.etag = stepRes.etag;
+          /* 拉到了但确实没变化：新位置的第一轮也到此为止，别再每轮强拉 */
+          if (m.forcePull) m.forcePull = false;
         }
 
         /* ★ 推不推，只看「有没有待推送的增量」，与「pull 有没有变化」无关。
@@ -4601,10 +5615,23 @@ XJ.sync = (function () {
           return pushWithRetry(s, m, again, tr, attempt + 1);
         });
       }
-      if (res.status === 401) { noteError(m, 'auth', '令牌已失效或被删除'); return { ok: false, reason: 'auth' }; }
-      if (res.status === 403) { noteError(m, 'rate', '触发 GitHub 限流或权限不足'); return { ok: false, reason: 'rate' }; }
-      if (res.status === 404) { noteError(m, 'missing', '云端 Gist 不存在或已被删除'); return { ok: false, reason: 'missing' }; }
-      noteError(m, 'http', '写入失败（HTTP ' + res.status + '）');
+      if (res.status === 401) {
+        noteError(m, 'auth', '令牌已失效或被删除（GitHub：' + (ghErrorText(res) || '未通过认证') + '）');
+        return { ok: false, reason: 'auth' };
+      }
+      if (res.status === 403) {
+        noteError(m, 'rate', httpFailMsg('GitHub 拒绝了这次写入（限流或权限不足）', res));
+        return { ok: false, reason: 'rate' };
+      }
+      if (res.status === 404) {
+        noteError(m, 'missing', '云端位置不存在或已被删除（HTTP 404）');
+        return { ok: false, reason: 'missing' };
+      }
+      if (res.status === 422) {
+        noteError(m, 'http', httpFailMsg('云端不接受这份内容', res));
+        return { ok: false, reason: 'http' };
+      }
+      noteError(m, 'http', httpFailMsg('写入失败', res));
       return { ok: false, reason: 'http' };
     }).catch(function (e) {
       noteError(m, 'net', '网络不可用：' + (e && e.message ? e.message : '未知错误'));
@@ -4613,6 +5640,22 @@ XJ.sync = (function () {
   }
 
   /* ---------------- 定时器与生命周期 ---------------- */
+
+  /** 就绪队列：一轮还在跑时，后来的请求排队等它跑完再跑，而不是被丢掉。
+   *
+   *  ★ 为什么必须这样（踩过）：过去 `running` 为真就直接返回 `{ok:false, reason:'busy'}`。
+   *    于是「点立即同步」和「切换云端位置 → 合并」这两条路径，只要恰好撞上正在跑的
+   *    轮询，就会【静默什么都没做】——调用方拿到的还是一个 promise（只是结果是 busy），
+   *    很容易被当成「已经做完了」。切换位置时这尤其致命：
+   *    merge 没跑 → 账本还是空的 → 紧接着的「补推差集」认为「云端什么都没有」，
+   *    结果一条都不推，界面却显示成功。
+   *    串行队列既保住了「同一时刻只有一轮在跑」，又不会让用户的动作消失。 */
+  var chain = Promise.resolve();
+  function enqueue(fn) {
+    var next = chain.then(fn, fn);
+    chain = next.catch(function () { return null; });
+    return next;
+  }
 
   function schedulePush() {
     if (!isOn()) return;
@@ -16819,6 +17862,34 @@ XJ.views.symbol = (function () {
     return '已连接 · 上次同步 ' + String(st.lastOkAt).slice(0, 16).replace('T', ' ');
   }
 
+  /** 位置指纹：前 6 位 + 后 4 位。
+   *  两端字形一致、又能一眼比对 —— 这是判断「两台设备是不是同一个盒子」的唯一可靠办法。 */
+  function gistFingerprint(id) {
+    var s = String(id || '');
+    if (s.length <= 10) return s;
+    return s.slice(0, 6) + '…' + s.slice(-4);
+  }
+
+  /** 自检卡的每一行（值可能是 HTML，调用方负责转义） */
+  function syncDiagRows() {
+    var st = XJ.sync && XJ.sync.status ? XJ.sync.status() : null;
+    var sm = S.state.syncMeta || {};
+    if (!st) return [];
+    var rows = [];
+    rows.push(['本次开机同步状态', syncEnabledNow() ? '已开启' : '未开启（下面所有信息都还是本机的）']);
+    rows.push(['本机设备编号', st.deviceId ? String(st.deviceId).slice(0, 8) : '（还没有）']);
+    rows.push(['云端位置编号', sm.gistId ? gistFingerprint(sm.gistId) : '（还没选）']);
+    rows.push(['云端版本号', '第 ' + U.n0(st.version) + ' 版']);
+    var scopes = st.tokenScopes;
+    if (sm.token) {
+      rows.push(['令牌权限', scopes === null || scopes === undefined ? '（未返回，通常是细粒度令牌）'
+        : (String(scopes).indexOf('gist') >= 0 ? String(scopes) + '（含 gist，可读写）' : String(scopes) + '（⚠ 没有 gist 权限，写入会被拒）')]);
+    }
+    if (st.lastOkAt) rows.push(['上次成功同步', String(st.lastOkAt).slice(0, 16).replace('T', ' ')]);
+    rows.push(['待同步改动', U.n0(st.pending) + ' 项']);
+    return rows;
+  }
+
   function syncBodyHtml() {
     var sm = S.state.syncMeta || {};
 
@@ -16850,44 +17921,65 @@ XJ.views.symbol = (function () {
         '<button class="btn-block" data-act="syncEnable">我明白了，开启同步</button>';
     }
 
-    /* ---- 已开启：配对与状态 ---- */
-    var html = '';
+    /* ---- 已开启：先给一张能自证的自检卡，再给操作 ---- */
+    var html = syncGuideHtml();
     html += '<div class="card" style="box-shadow:none;background:var(--card-2);margin-bottom:14px;padding:12px 14px">' +
       '<div class="kv" style="padding:4px 0"><span class="k">状态</span><span class="v">' +
       U.esc(syncStateLine()) + '</span></div>' +
-      (sm.gistId
-        ? '<div class="kv" style="padding:4px 0"><span class="k">云端位置</span><span class="v" style="font-family:var(--mono);font-size:12px">' +
-          U.esc(String(sm.gistId).slice(0, 12)) + '…</span></div>'
-        : '') +
-      '<div class="kv" style="padding:4px 0"><span class="k">待同步改动</span><span class="v">' +
-      U.n0((sm.outbox || []).length) + ' 项</span></div>' +
+      syncDiagRows().map(function (r) {
+        return '<div class="kv" style="padding:4px 0"><span class="k">' + U.esc(r[0]) + '</span>' +
+          '<span class="v" style="font-size:12.5px">' + U.esc(r[1]) + '</span></div>';
+      }).join('') +
+      '</div>' +
+      /* 这张卡就是「两台设备为什么没同步」的自证工具：
+         真正要核对的是【云端位置编号】—— 两边不一样就永远同步不了，而过去界面
+         完全没有地方能看出这件事。 */
+      '<div class="tiny" style="line-height:1.7;margin:-6px 0 14px">' +
+      '核对方法：两台设备的「云端位置编号」必须<strong>逐字相同</strong>。' +
+      '不同就是各自连了一个云端的盒子 —— 用下面的「切换云端位置」接回来（会合并，不丢数据）。' +
       '</div>';
 
-    if (sm.lastErr) {
-      html += '<div class="tiny" style="line-height:1.7;margin-bottom:12px;color:var(--down)">' +
-        '⚠ ' + U.esc(sm.lastErr.msg || '同步失败') +
-        (sm.lastErr.kind === 'auth'
-          ? '<br>令牌可能被删掉或已过期。请到 GitHub 重新生成一个（只勾 gist），再在下面重新填入。'
-          : sm.lastErr.kind === 'missing'
-            ? '<br>云端那份数据不在了。可以点「新建同步位置」重新开始。'
-            : '<br>这不会影响本机数据，联网后会自动继续。') +
-        '</div>';
+    if (sm.legacyHealed) {
+      html += '<div class="tiny" style="line-height:1.7;margin-bottom:12px;color:var(--up)">' +
+        '✓ 已自动修复过一次同步记录：过去的版本每次打开网页都会把同步设置清空。' +
+        '本机与云端的数据都没有被删除。</div>';
     }
 
-    /* 安装链接：配对完成之后才谈得上，一条链接 = 其它设备点一次就配好 */
+    if (sm.lastErr) {
+      var hint = sm.lastErr.kind === 'auth'
+        ? '令牌可能被删掉或已过期。请到 GitHub 重新生成一个（只勾 gist），再在下面重新填入。'
+        : sm.lastErr.kind === 'missing'
+          ? '云端那份数据不在了。可以点「新建同步位置」重新开始。'
+          : sm.lastErr.kind === 'net'
+            ? '这不会影响本机数据，联网后会自动继续。'
+            : sm.lastErr.kind === 'conflict'
+              ? '两端同时改动了同一条，已按修订号取新。再点一次「立即同步」即可。'
+              : /* http / rate / public / corrupt：都是「这次要你动手」，不是等联网自愈 */
+              '这一步需要你处理：<b>联网并不会让它自己好</b>。若上面写着令牌权限不足，' +
+              '请重新生成一个只勾 gist 的令牌；若写着 400/422，请把这句话发给我。';
+      html += '<div class="tiny" style="line-height:1.7;margin-bottom:12px;color:var(--down)">' +
+        '⚠ ' + U.esc(sm.lastErr.msg || '同步失败') + '<br>' + hint + '</div>';
+    }
+
+    /* 接入新设备：口令 / 二维码。配对完成之后才谈得上 —— 一条口令 = 其它设备一次接入。 */
     if (sm.token && sm.gistId) {
       html += '<div class="card" style="box-shadow:none;background:var(--card-2);margin-bottom:14px;padding:12px 14px">' +
         '<div class="tiny" style="line-height:1.8">' +
-        '<b>在其它设备上「一次点开就配好」</b><br>' +
-        '生成一条安装链接，发到你的手机 / 平板 / 电脑上各点开一次：' +
-        '它会自动填入令牌、自动选中这份云端数据、并立刻拉齐。之后那台设备' +
-        '<strong>每次打开都自动同步，不用再登录、不用再配置</strong>。' +
+        '<b>📱 接入新设备（只做一次）</b><br>' +
+        '① 在这台设备上点「显示二维码」；<br>' +
+        '② 新设备用<strong>相机扫码</strong>，或把口令复制过去粘贴 → 点「粘贴并接入」。<br>' +
+        '之后那台设备<strong>每次打开都自动同步，不用再登录、不用再配置</strong>。' +
         '</div></div>' +
-        '<button class="btn-block" data-act="syncInstallLink">生成安装链接</button>';
+        '<button class="btn-block" data-act="syncPairQr">显示二维码 / 接入口令</button>' +
+        '<div class="field" style="margin-top:10px"><label>接入口令（粘贴到这里接入本机）</label>' +
+        '<textarea data-k="syncCode" rows="2" autocomplete="off" placeholder="把另一台设备的接入口令整段粘贴到这里" ' +
+        'style="font-family:var(--mono);font-size:11.5px"></textarea></div>' +
+        '<button class="btn-block ghost" data-act="syncUseCode">粘贴并接入</button>' +
+        '<button class="btn-block ghost" data-act="syncReadClip">从剪贴板读取并接入</button>';
     } else if (!sm.gistId) {
       html += '<div class="tiny" style="margin-bottom:14px;line-height:1.7">' +
-        '完成下面两步（填入令牌 → 选中云端位置）后，就能生成一条安装链接，' +
-        '让其它设备点开一次即可自动同步。</div>';
+        '完成下面两步（填入令牌 → 选中云端位置）后，就能生成一条二维码/口令，' +
+        '让其它设备扫一下即接入。</div>';
     }
 
     /* 令牌 */
@@ -16903,25 +17995,105 @@ XJ.views.symbol = (function () {
 
     if (syncLoaded) {
       if (syncLoaded.length) {
-        html += '<div class="field" style="margin-top:14px"><label>选择要用的云端位置</label>' +
+        html += '<div class="field" style="margin-top:14px"><label>我的云端位置（点一下就接过去）</label>' +
           syncLoaded.map(function (g) {
-            return '<button class="btn-block ghost" data-act="syncPickGist" data-id="' + U.esc(g.id) + '">' +
-              U.esc(g.description || '（无描述）') + ' · ' + U.esc(String(g.id).slice(0, 8)) + '…</button>';
-          }).join('') + '</div>';
+            var cur = sm.gistId === g.id;
+            var when = String(g.updatedAt || '').slice(0, 16).replace('T', ' ');
+            return '<button class="btn-block ' + (cur ? '' : 'ghost') + '" data-act="syncPickGist" data-id="' + U.esc(g.id) + '">' +
+              (cur ? '✓ 当前：' : '接入：') + U.esc(gistFingerprint(g.id)) +
+              (when ? ' · 最后更新 ' + U.esc(when) : '') + '</button>';
+          }).join('') +
+          '<div class="tiny" style="margin-top:8px;line-height:1.7">' +
+          '两条以上说明你在不同设备上各建过一个盒子 —— 那是「两边永远不同步」的原因。' +
+          '挑手机上正在用的那个接过来，数据会<strong>合并</strong>，两边都不丢。' +
+          '</div></div>';
       } else {
-        html += '<div class="tiny" style="margin-top:12px">这台设备上还没有同步用的 Gist，' +
-          '点下面新建一个（会建成<b>私有</b>的）。</div>';
+        html += '<div class="tiny" style="margin-top:12px">这台设备上还没有云端位置，' +
+          '点下面新建一个（会建成<b>私有</b>的）。<br>' +
+          '<b>只有在第一台设备上才需要新建</b>；其它设备请用上面的二维码/口令接入。</div>';
       }
     }
 
     html += '<button class="btn-block" style="margin-top:12px" data-act="syncCreateGist">新建同步位置</button>' +
       '<button class="btn-block ghost" data-act="syncNow">立即同步</button>' +
+      (sm.gistId ? '<button class="btn-block ghost" data-act="syncReseed">与云端重新合并（不丢数据）</button>' : '') +
+      '<button class="btn-block ghost" data-act="syncInstallLink">改用安装链接（老办法）</button>' +
       '<button class="btn-block ghost" data-act="syncDisable">关闭同步</button>' +
       '<div class="tiny" style="margin-top:12px;line-height:1.7">' +
       '关闭同步不会删除任何数据：本机记录保留，云端那份也保留，随时可以再打开。' +
       '</div>';
 
     return html;
+  }
+
+  /** 📱 接入新设备的两步图文引导（默认收起，避免把面板撑得太长） */
+  function syncGuideHtml() {
+    return '<details class="card" style="box-shadow:none;background:var(--card-2);margin-bottom:14px;padding:12px 14px">' +
+      '<summary style="cursor:pointer;font-size:13px"><b>第一次用？两步接好，以后不用管</b></summary>' +
+      '<div class="tiny" style="line-height:1.85;margin-top:10px">' +
+      '<b>第一步（只在一台设备上做）</b><br>' +
+      '填令牌 → 点「新建同步位置」。然后点上面的「显示二维码 / 接入口令」。<br><br>' +
+      '<b>第二步（其余每台设备各做一次）</b><br>' +
+      '打开同一个网址 → 我的 → 数据管理 → 跨设备同步 → 粘贴口令或扫码 → 「粘贴并接入」。' +
+      '若那台设备已有记录，问「合并还是替换」时选<strong>合并</strong>。<br><br>' +
+      '<b>接好之后</b><br>' +
+      '不用管了。任何一台设备改了，其它设备 <strong>1 分钟内</strong>自动一致；' +
+      '回到前台的那一刻会立刻对齐一次。想马上看到就点「立即同步」。<br><br>' +
+      '<b>自查四条</b><br>' +
+      '· 状态行写「已连接 · 上次同步 …」才是好的<br>' +
+      '· 两台设备的<strong>云端位置编号</strong>必须一模一样<br>' +
+      '· 地址以 <code>file://</code> 打开时无法同步（浏览器限制）<br>' +
+      '· 接错了别慌：在上面「我的云端位置」里点正确那个，会合并、不丢数据' +
+      '</div></details>';
+  }
+
+  /** 一次性自愈：重建被旧 bug 清空的修订账本。
+   *
+   *  旧版本启动时把【本机存档】也当成「导入别人的备份」来解析，于是每次开网页
+   *  都会把 syncMeta 整份丢掉 —— 开关、令牌、云端位置、设备身份、以及 versions 账本。
+   *  账本一空，diffToOps 就把本机全部记录当成「新增」重新入队，
+   *  反复开关几次后云端堆出一大团重复增量，写入最终被 GitHub 拒绝（HTTP 400）。
+   *
+   *  这里只在「账本空 + 记录上还带着历史修订戳」时动手：
+   *  按记录自己的 (rev, rt, rd)、按 sync-core 同一套 contentHash 重建账本，
+   *  于是既有的 outbox 照原样推上去，而远端较旧的快照会因为修订戳更小而【盖不动】本机 ——
+   *  手机上最新的加仓减仓因此不会丢。
+   *
+   *  ★ 只重建，不产出任何 op（不是 seedVersions）：避免把伤害放大成又一轮整份重推。
+   *  ★ 幂等：账本非空时直接返回 null。 */
+  function healSyncLedger(state) {
+    if (!state || !state.syncMeta) return null;
+    var core = XJ.syncCore;
+    if (!core || !core.meta || !core.vid || !core.contentHash) return null;
+    var m = core.meta(state);
+    if (!m.deviceId) return null;                              // 这台设备从没配过同步 → 没什么可修
+    if (m.legacyHealed === true) return null;                  // 已经修过，不再重复
+    if (m.versions && Object.keys(m.versions).length) return null;  // 账本还在 → 没坏
+
+    var rebuilt = 0;
+    for (var ti = 0; ti < core.TYPES.length; ti++) {
+      var type = core.TYPES[ti];
+      var def = core.DEFS[type];
+      if (!def || !def.all || !def.get) continue;
+      var ids = def.all(state);
+      for (var ii = 0; ii < ids.length; ii++) {
+        var rec = def.get(state, ids[ii]);
+        if (!rec || typeof rec !== 'object') continue;
+        var rev = U.n0(rec.rev);
+        if (!rev) continue;                                    // 没戳 = 从没进过同步，交给 diffToOps 当新增
+        m.versions[core.vid(type, ids[ii])] = {
+          rev: rev,
+          rt: U.n0(rec.rt),
+          rd: String(rec.rd || ''),
+          h: core.contentHash(def, rec),
+          q: 1,                                                // 本机见过实体 → 以后真删了才会发墓碑
+        };
+        rebuilt++;
+      }
+    }
+    if (!rebuilt) return null;                                 // 没有任何带戳的记录 → 不需要修
+    m.legacyHealed = true;
+    return rebuilt;
   }
 
   function openSyncSheet() {
@@ -16936,6 +18108,225 @@ XJ.views.symbol = (function () {
     var box = document.getElementById('xj-sync-body');
     if (!box) return;
     box.innerHTML = syncBodyHtml();
+  }
+
+  /* ---------------- 接入口令 / 二维码 ----------------
+   * 口令 = 安装链接里 #xjsync= 后面那段，可以复制、可以变成二维码扫。
+   * 两者是同一份载荷的两种呈现，所以下面一律走同一条生成路径。 */
+  var syncCode = null;        // 本次生成的口令（只存内存，不落盘、不进导出）
+
+  /* ---------------- 切换云端位置 / 重来一次 ----------------
+   * 这是「接错盒子」和「觉得两边不一致」的唯一自救路径。
+   * ★ 顺序很关键，必须【先拉取合并、再补推差集】：
+   *   ① 先 tick 一次：拉目标位置的云端 + 与本机按修订戳合并（installMode='merge'，绝不覆盖），
+   *      这一步之后账本才知道「云端已经有哪些」；
+   *   ② 再把「云端没有的那几条本机记录」作为 upsert 入队并推一次。
+   *   顺序反过来的话，本机会把云端已有的记录再推一遍，每输一次版本号涨一次 ——
+   *   那正是「重复增量把云端撑大、最后写入被 GitHub 拒」的老路。
+   *
+   * ★ 绝不 overwrite：用户点这个按钮的意图是「都别丢」。
+   */
+
+  /** 换云端位置时【必须】重置「对这个远端的记忆」。
+   *
+   *  ★ 这是一个真实的坑：`version` 是【那个 Gist 里的】结构版本号，换到另一个 Gist 后
+   *    旧数字毫无意义。而 tick 里有一句「远端 version 与本地相同就当没变化」——
+   *    于是换位置后第一次拉取会被这句短路掉：不合并、不更新 etag、也不登记账本，
+   *    表现就是「接了回来，却什么都没同步」，而界面还显示成功。
+   *    同理 etag 也必须清掉：那是另一个远端资源的指纹，带着它做条件请求毫无意义。 */
+  function resetRemoteMemory(st, gistId) {
+    var m = XJ.syncCore.meta(st);
+    m.gistId = gistId;
+    m.etag = null;
+    m.version = 0;
+    /* ★ forcePull：这一次拉取必须【无条件当真】。
+       光把 version 归零还不够 —— 若新位置的 version 恰好也是 0（新建的位置就是 0），
+       同步层那句「远端版本与本地相同＝没变化」会把整次拉取短路掉：
+       不合并、不更新 etag、不登记账本，表现为「接了回来却什么都没同步」。
+       所以必须显式放行一次；合并完成后由 sync.js 清掉。 */
+    m.forcePull = true;
+  }
+
+  /**
+   * 把这个位置【云端还没有的】本机记录补推上去。
+   *
+   * @param {boolean} wasPaired 这次合并【之前】是否已经与「该位置」对齐过。
+   *   ★ 必须在合并【之前】取这个值：mergeRemote 会把 everPaired 置为 true，
+   *     合并后再读就永远是 true 了。
+   *   判断「云端到底有没有这条」的唯一依据就是它：
+   *     · wasPaired === false → 这份账本是用当前位置刚建起来的，本机记录都还没推上去；
+   *     · wasPaired === true  → 已经与这个位置对齐过，账本里 q===1 就意味着「云端也有」。
+   *   ★ 不能用「q !== 1」当判据：mergeRemote 的 adoptVersions 会把「本机有、云端没有」的记录
+   *     标成 q:1（那是它自己的口径：本机持有实体）。拿它挑差集会挑出空集 ——
+   *     于是「接了回来，本机独有的记录却一条都没推上去」。
+   *   ★ 也不能无条件全推：那会把云端已有的记录再推一遍，每输一次版本号涨一次，
+   *     正是「重复增量把云端撑大、最后写入被拒」的老路。
+   */
+  function pushMissingAfterMerge(scope, wasPaired) {
+    var queued = 0;
+    var diff = (scope === 'diff');
+    S.commit(function (st) {
+      var m = XJ.syncCore.meta(st);
+      var only = null;
+      if (diff) {
+        only = {};
+        for (var ti = 0; ti < XJ.syncCore.TYPES.length; ti++) {
+          var t = XJ.syncCore.TYPES[ti];
+          var def = XJ.syncCore.DEFS[t];
+          if (!def) continue;
+          var ids = def.all(st);
+          for (var ii = 0; ii < ids.length; ii++) {
+            var key = XJ.syncCore.vid(t, ids[ii]);
+            var known = m.versions[key];
+            if (!wasPaired || !known || known.q !== 1) only[key] = true;
+          }
+        }
+      }
+      queued = XJ.syncCore.enqueueAll(st, only ? { keys: only } : null);
+    });
+    return queued;
+  }
+
+  /** 真正落地切换：写位置 → 先合并 → 再补推差集。（问不问用户由调用方决定） */
+  function applySwitch(id, token) {
+    var s = S.state;
+    if (!id || !token) { UI.toast('请先填好令牌'); return; }
+    /* ★ 必须在合并【之前】记下「是否已经与这个位置对齐过」：
+       mergeRemote 会把它置为 true，合并后再读就永远是 true，
+       于是「云端还没有的本机记录」会被判成「云端已经有了」而一条都不推。 */
+    var wasPaired = !!(s.syncMeta && s.syncMeta.everPaired === true);
+    S.commit(function (st) {
+      var m = XJ.syncCore.meta(st);
+      m.token = token;
+      resetRemoteMemory(st, id);
+      m.enabled = true;
+      m.installMode = 'merge';          // ★ 首次必合并（mergeRemote 用完即清）
+    });
+    XJ.sync.start();
+    XJ.sync.tick({ silent: true }).then(function (r) {
+      var queued = pushMissingAfterMerge('diff', wasPaired);
+      if (queued) XJ.sync.tick({ silent: true }).then(function () { refreshSyncSheet(); });
+      refreshSyncSheet();
+      UI.toast(r && r.ok
+        ? ('已接回并合并' + (queued ? '，本机独有的 ' + queued + ' 条已补推上去' : ''))
+        : '已保存，但这次没能完成同步 —— 原因见上方状态', 4000);
+    });
+  }
+
+  function switchSyncLocation(id, token) {
+    if (!id || !token) return UI.toast('请先填好令牌');
+    UI.confirm({
+      title: '切换到 ' + gistFingerprint(id) + ' ？',
+      html: '会先把这个位置的云端数据与本机记录<strong>合并</strong>（两边都不丢），' +
+        '再把本机独有的记录补推上去。<br><br>你原来那个位置<strong>不会被删除</strong>，随时可以切回来。',
+      confirmText: '合并并切换',
+    }).then(function (ok) {
+      if (ok) applySwitch(id, token);
+      else UI.toast('已取消，本机数据没有任何改动');
+    });
+  }
+
+  /** 重来一次：不换位置，先合并一次，再把云端没有的本机记录补推上去 */
+  function reseedSync() {
+    var wasPaired = !!(S.state.syncMeta && S.state.syncMeta.everPaired === true);
+    XJ.sync.start();
+    XJ.sync.tick({ silent: true }).then(function () {
+      var queued = pushMissingAfterMerge('diff', wasPaired);
+      if (!queued) { refreshSyncSheet(); UI.toast('两边已经一致，无需补推'); return; }
+      XJ.sync.tick({ silent: true }).then(function (r) {
+        refreshSyncSheet();
+        UI.toast(r && r.ok ? ('已重新合并，补推了 ' + queued + ' 条') : '这次没能完成，原因见上方状态', 3200);
+      });
+    });
+  }
+
+  /** 站点基址（含子目录），去掉 # 之后的所有东西 */
+  function installBase() {
+    try { return String(location.href).split('#')[0]; } catch (e) { return ''; }
+  }
+
+  /** 生成口令（并在本机生成/复用配对密钥）。返回 {code, plain} 或 null。 */
+  function makePairCode() {
+    var s = S.state;
+    if (!s || !s.syncMeta || !s.syncMeta.token || !s.syncMeta.gistId) return Promise.resolve(null);
+    var key = null;
+    try { key = XJ.syncCore.ensurePairKey(s); } catch (e) { key = null; }
+    return XJ.syncCore.encodePairCode({ token: s.syncMeta.token, gistId: s.syncMeta.gistId, key: key })
+      .then(function (r) {
+        if (r && r.code) S.commit(function () { /* 只为把新生成的配对密钥落盘 */ });
+        syncCode = r || null;
+        return r || null;
+      });
+  }
+
+  /** 显示二维码（生成不出来的话如实说明原因，并给出复制口令的退路） */
+  function showPairQr() {
+    makePairCode().then(function (r) {
+      if (!r || !r.code) { UI.toast('还缺令牌或云端位置，无法生成口令'); return; }
+      var svg = XJ.qr ? XJ.qr.svg(r.code, { unit: 5 }) : null;
+      var tips = r.plain
+        ? '<div class="tiny" style="margin-top:10px;line-height:1.7;color:var(--down)">' +
+          '⚠ 当前环境不支持加密（<code>file://</code> 打开时浏览器不提供加密接口），' +
+          '所以这条口令里的令牌是<strong>明文</strong>的。请不要截图发给别人。</div>'
+        : '<div class="tiny" style="margin-top:10px;line-height:1.7">' +
+          '口令里的令牌已<strong>加密</strong>（图片里看不到明文）。但拿到口令仍等于拿到写权限，请只给自己的设备扫。</div>';
+      UI.openSheet({
+        title: '接入口令 · 扫这个码',
+        html:
+          '<div class="tiny" style="line-height:1.75;margin-bottom:12px">' +
+          '用新设备的<strong>相机</strong>扫下面的码，或把下面这段口令发给自己再粘贴。</div>' +
+          (svg
+            ? '<div style="text-align:center;background:#fff;padding:10px;border-radius:14px">' +
+              '<div style="width:100%;max-width:300px;margin:0 auto">' + svg + '</div></div>'
+            : '<div class="tiny" style="color:var(--down)">口令太长，这张码画不下。请直接用下面的口令文本。</div>') +
+          tips +
+          '<div class="field" style="margin-top:14px"><label>接入口令（长按可复制）</label>' +
+          '<textarea id="xj-pair-code" readonly rows="3" style="font-family:var(--mono);font-size:11.5px">' +
+          U.esc(r.code) + '</textarea></div>' +
+          '<button class="btn-block" data-act="syncCopyCode">复制口令</button>' +
+          '<div class="tiny" style="margin-top:10px;line-height:1.7">' +
+          '新设备上：我的 → 数据管理 → 跨设备同步 → 粘贴进「接入口令」输入框 → 点「粘贴并接入」。' +
+          '若那台设备已有记录，会先问你「合并还是替换」——<strong>选合并</strong>。</div>',
+      });
+    });
+  }
+
+  /** 解析并接入一段口令（链接、口令文本都走这里） */
+  function usePairCode(text) {
+    var raw = XJ.syncCore.parsePairText(text);
+    if (!raw) {
+      UI.toast('这不是一条完整的接入口令。请把整段复制过来（不要只复制一部分）', 4200);
+      return;
+    }
+    if (!syncAvailable()) {
+      UI.toast('这条口令要在已部署的网址上打开才能接入（file:// 无法同步）', 4000);
+      return;
+    }
+    XJ.syncCore.decodePairCode(raw).then(function (r) {
+      if (!r || !r.ok) {
+        if (r && r.reason === 'no-crypto') UI.toast('这台设备的浏览器不提供加密接口，无法解开这条口令', 4200);
+        else if (r && r.reason === 'bad-key') UI.toast('口令解不开：可能被截断或改动过，请重新复制完整口令', 4200);
+        else UI.toast('口令格式不对，没有改动本机任何数据', 4200);
+        return;
+      }
+      var payload = { token: r.token, gistId: r.gistId };
+      var fp = String(r.gistId).slice(0, 6) + '…' + String(r.gistId).slice(-4);
+      UI.confirm({
+        title: '接入这个云端位置？',
+        html: '口令指向：<br><span style="font-family:var(--mono)">' + U.esc(fp) + '</span><br><br>' +
+          '本机已有记录时会问你「合并还是替换」（默认建议合并）。',
+        confirmText: '接入',
+      }).then(function (ok) {
+        if (ok) applyPairPayload(payload, installBase());
+      });
+    });
+  }
+
+  /** 读取弹层里的口令输入框 */
+  function readCodeInput() {
+    var box = document.getElementById('xj-sync-body');
+    var el = box ? box.querySelector('[data-k="syncCode"]') : null;
+    return el ? String(el.value || '') : '';
   }
 
   /** 读取弹层里的令牌：留空表示「沿用已保存的那个」 */
@@ -16991,49 +18382,111 @@ XJ.views.symbol = (function () {
     });
   });
 
+  /** 选/切换到某个云端位置。★ 一律走 switchSyncLocation（merge + enqueueAll），
+   *  过去「选位置」和「切换位置」是两条写法不同的路径，那是隐患。 */
   UI.on('syncPickGist', function (node) {
     var id = node.getAttribute('data-id');
     var token = readTokenInput();
     if (!id || !token) return UI.toast('请先填好令牌');
-    S.commit(function (s) {
-      var m = XJ.syncCore.meta(s);
-      m.token = token;
-      m.gistId = id;
-      m.etag = null;
-      m.enabled = true;
+    var cur = (S.state.syncMeta || {}).gistId;
+    if (cur === id) { refreshSyncSheet(); return UI.toast('已经在这个位置上了'); }
+    var hasLocal = (S.state.transactions && S.state.transactions.length > 0) ||
+      (S.state.received && S.state.received.length > 0);
+    if (!hasLocal) { switchSyncLocation(id, token); return; }
+    var fp = gistFingerprint(id);
+    UI.confirm({
+      title: '切换到 ' + fp + '？',
+      html: '会把本机记录与这个位置的云端记录<strong>合并</strong>（两边都不丢），' +
+        '合并后本机记录也会推上去。<br><br>你原来那个位置<strong>不会被删除</strong>，随时可以切回来。',
+      confirmText: '合并并切换',
+    }).then(function (ok) { if (ok) switchSyncLocation(id, token); });
+  });
+
+  /** 把本机全部记录重新并上云端（「觉得两边不一致」时的自救） */
+  UI.on('syncReseed', function () {
+    if (!S.state.syncMeta || !S.state.syncMeta.gistId) return UI.toast('请先选中一个云端位置');
+    UI.confirm({
+      title: '与云端重新合并',
+      html: '会把本机全部记录重新与云端合并一次。**不会删除任何数据** —— ' +
+        '删除是靠墓碑传递的，这里只补推实体。<br><br>当两边「看起来不一致」时用它。',
+      confirmText: '重新合并',
+    }).then(function (ok) { if (ok) reseedSync(); });
+  });
+
+  UI.on('syncPairQr', function () {
+    var sm = S.state.syncMeta || {};
+    if (!sm.token || !sm.gistId) return UI.toast('请先填入令牌并选中云端位置');
+    showPairQr();
+  });
+
+  UI.on('syncUseCode', function () { usePairCode(readCodeInput()); });
+
+  UI.on('syncReadClip', function () {
+    if (!(navigator.clipboard && navigator.clipboard.readText)) {
+      return UI.toast('当前环境不支持读剪贴板，请粘贴到上面的输入框', 3600);
+    }
+    navigator.clipboard.readText().then(function (txt) {
+      if (!txt || !txt.trim()) return UI.toast('剪贴板是空的');
+      usePairCode(txt.trim());
+    }).catch(function () {
+      UI.toast('读不到剪贴板（浏览器需要你手动允许），请粘贴到上面的输入框', 3600);
     });
-    /* 选完立刻对齐一次：让用户马上看到另一台设备的数据 */
-    UI.toast('正在对齐云端数据…');
-    XJ.sync.tick({ silent: true }).then(function (r) {
-      refreshSyncSheet();
-      UI.toast(r && r.ok ? '已连接到云端' : '已保存，但这次没能取到云端数据');
-    });
-    XJ.sync.start();
+  });
+
+  UI.on('syncCopyCode', function () {
+    var el = document.getElementById('xj-pair-code');
+    var code = el ? String(el.value || '') : (syncCode && syncCode.code) || '';
+    if (!code) return UI.toast('还没有生成口令');
+    copyText(code);
   });
 
   UI.on('syncCreateGist', function () {
     var token = readTokenInput();
     if (!token) return UI.toast('请先粘贴 GitHub 令牌');
-    UI.toast('正在创建…');
-    XJ.sync.checkToken(token).then(function (chk) {
-      if (!chk.ok) { UI.toast(chk.msg || '令牌不可用'); return null; }
-      return XJ.sync.createSyncGist(token).then(function (r) {
-        if (!r.ok) { UI.toast(r.msg || '创建失败'); return null; }
-        if (r.isPublic) {
-          UI.toast('警告：创建出来的是公开 Gist，请勿使用', 4000);
+
+    /* ★ 防呆：令牌下已经有同步位置时先拦一下。
+       踩过：用户在第二台设备上又点了一次「新建同步位置」，
+       于是两台设备各自连到一个盒子、永远不会互通，而界面完全看不出这件事。 */
+    var go = function () {
+      UI.toast('正在创建…');
+      XJ.sync.checkToken(token).then(function (chk) {
+        if (!chk.ok) { UI.toast(chk.msg || '令牌不可用'); return null; }
+        return XJ.sync.createSyncGist(token).then(function (r) {
+          if (!r.ok) { UI.toast(r.msg || '创建失败'); return null; }
+          if (r.isPublic) {
+            UI.toast('警告：创建出来的是公开 Gist，请勿使用', 4000);
+            return null;
+          }
+          var queued = 0;
+          S.commit(function (s) {
+            var m = XJ.syncCore.meta(s);
+            m.token = token;
+            resetRemoteMemory(s, r.gistId);   // 新位置：清掉对旧远端的记忆（etag / version）
+            m.enabled = true;
+            /* 新位置是空的，本机数据必须整份推上去 */
+            queued = XJ.syncCore.enqueueAll(s);
+          });
+          XJ.sync.start();
+          XJ.sync.tick({ silent: true }).then(function () { refreshSyncSheet(); });
+          UI.toast('已创建私有位置，本机 ' + queued + ' 条记录正在推上去');
           return null;
-        }
-        S.commit(function (s) {
-          var m = XJ.syncCore.meta(s);
-          m.token = token;
-          m.gistId = r.gistId;
-          m.etag = null;
-          m.enabled = true;
         });
-        XJ.sync.start();
-        refreshSyncSheet();
-        UI.toast('已创建私有 Gist，其它设备填同一个令牌即可选到它');
-        return null;
+      });
+    };
+
+    XJ.sync.listSyncGists(token).then(function (ls) {
+      var items = (ls && ls.items) || [];
+      if (!items.length) { go(); return; }
+      UI.confirm({
+        title: '你已经有一个云端位置了',
+        html: '新建会再开一个<strong>空的盒子</strong>，两台设备就各自连一个、<strong>永远不会同步</strong>。' +
+          '<br><br>如果你是想让新设备加入，正确做法是：在新设备上粘贴本机生成的<strong>接入口令</strong>' +
+          '（或扫二维码），而不是新建。<br><br>确实要另起一个吗？',
+        confirmText: '我确定要再建一个',
+        danger: true,
+      }).then(function (ok) {
+        if (!ok) { refreshSyncSheet(); return; }
+        go();
       });
     });
   });
@@ -17063,17 +18516,13 @@ XJ.views.symbol = (function () {
 
   /* ---------------- 安装链接 ---------------- */
 
-  /** 站点基址（含子目录），去掉 # 之后的所有东西 */
-  function installBase() {
-    try { return String(location.href).split('#')[0]; } catch (e) { return ''; }
-  }
-
-  /** 生成安装链接并复制到剪贴板 */
+  /** 生成安装链接并复制到剪贴板（与二维码同源：都用加密口令） */
   function copyInstallLink() {
-    var m = S.state.syncMeta || {};
-    var url = XJ.syncCore.buildInstallUrl(installBase(), { token: m.token, gistId: m.gistId });
-    if (!url) { UI.toast('还缺令牌或云端位置，无法生成'); return; }
-    copyText(url);
+    makePairCode().then(function (r) {
+      if (!r || !r.code) { UI.toast('还缺令牌或云端位置，无法生成'); return; }
+      var url = installBase().split('#')[0] + XJ.syncCore.INSTALL_KEY + r.code;
+      copyText(url);
+    });
   }
 
   UI.on('syncInstallLink', function () {
@@ -17081,12 +18530,13 @@ XJ.views.symbol = (function () {
     if (!m.token || !m.gistId) return UI.toast('请先填入令牌并选中云端位置');
     /* ★ 生成前必须把风险说清楚：这条链接就是钥匙，拿到它就能读写云端数据 */
     UI.confirm({
-      title: '生成安装链接',
-      html: '这条链接里<strong>包含你的同步钥匙</strong>（也就是那个 GitHub 令牌）。<br><br>' +
+      title: '生成安装链接（老办法）',
+      html: '这条链接里<strong>包含你的同步钥匙</strong>（也就是那个 GitHub 令牌，已加密）。<br><br>' +
         '任何人拿到这条链接，都能读写你这份云端数据。<b>请不要把它发到群里、' +
-        '不要贴进公开网页</b>。建议发到「文件传输助手」或自己的邮箱，只给自己的设备点开。<br><br>' +
-        '链接只对这台设备以外的其它设备有意义 —— 本机已经配好了。',
-      confirmText: '我知道，生成',
+        '不要贴进公开网页</b>。<br><br>' +
+        '<b>推荐改用上方「显示二维码 / 接入口令」</b>：同样是给自己的设备接入，' +
+        '但不用碰链接、也不会被聊天软件截断。',
+      confirmText: '我知道，生成链接',
     }).then(function (ok) {
       if (ok) copyInstallLink();
     });
@@ -17103,7 +18553,7 @@ XJ.views.symbol = (function () {
         title: '这台设备已有自己的记录',
         html:
           '<div class="tiny" style="line-height:1.75;margin-bottom:14px">' +
-          '本机已经有记账数据，云端也有一份。<b>要怎么办？</b><br><br>' +
+          '本机已经有记账数据，要接入的云端也有一份。<b>要怎么办？</b><br><br>' +
           '· <b>合并</b>：两边记录按条融合，谁都不会丢（推荐）<br>' +
           '· <b>替换</b>：丢掉本机这份，完全以云端为准' +
           '</div>' +
@@ -17131,8 +18581,10 @@ XJ.views.symbol = (function () {
     S.commit(function (s) {
       var m = XJ.syncCore.meta(s);
       m.token = payload.token;
-      m.gistId = payload.gistId;
-      m.etag = null;                 // 换位置必须重新全量拉一次
+      /* ★ 换位置必须把「对远端的记忆」清干净：etag 是另一个远端资源的指纹，
+         version 是另一个 Gist 里的结构版本号 —— 留着它会让第一次拉取被
+         「版本相同＝没变化」短路掉，于是接入动作看起来成功、实际什么都没同步。 */
+      resetRemoteMemory(s, payload.gistId);
       m.enabled = true;
       m.installMode = mode;          // 只生效一次，mergeRemote 用完就清
       /* 登记本机既有数据：只登记不产生 op，否则会把整份历史当成「本机新增」推上去 */
@@ -17189,18 +18641,8 @@ XJ.views.symbol = (function () {
     });
   }
 
-  /** 启动时处理 #xjsync=：这是「一劳永逸」的全部实现 */
-  function checkInstallHash() {
-    var payload = null;
-    try { payload = XJ.syncCore.readInstallHash(location.hash); } catch (e) { /* 忽略 */ }
-    if (!payload) return;
-    /* ★ 立刻清掉地址栏里的载荷：否则每次刷新都会重放一次安装动作 */
-    var base = installBase();
-    try { history.replaceState(null, '', base + location.search); } catch (e) { /* 忽略 */ }
-    if (!syncAvailable()) {
-      UI.toast('这条安装链接需要在已部署的网址上打开（file:// 无法同步）', 4000);
-      return;
-    }
+  /** 落地一段解析好的口令/链接载荷：有本地数据先问，没有就直接接入 */
+  function applyPairPayload(payload, base) {
     var s = S.state;
     var hasLocal = (s.transactions && s.transactions.length > 0) ||
       (s.received && s.received.length > 0);
@@ -17209,14 +18651,54 @@ XJ.views.symbol = (function () {
       askInstallMode(payload, base).then(function (mode) {
         if (!mode) { UI.toast('已取消，没有改动本机任何数据'); return; }
         commitInstall(payload, mode);
-        UI.toast(mode === 'overwrite' ? '正在核对链接，随后用云端数据替换本机…'
-          : '正在核对链接，随后把两边记录合并…', 3000);
+        UI.toast(mode === 'overwrite' ? '正在核对，随后用云端数据替换本机…'
+          : '正在核对，随后把两边记录合并…', 3000);
       });
       return;
     }
     /* 本机空白 → 无摩擦直接接入 */
     commitInstall(payload, 'overwrite');
-    UI.toast('正在核对安装链接并拉取云端数据…', 3000);
+    UI.toast('正在核对接入口令并拉取云端数据…', 3000);
+  }
+
+  /** 启动时处理 #xjsync=：口令（加密 XJ2e）与旧明文链接（XJ1p）走同一条落地路径 */
+  function checkInstallHash() {
+    var hash = '';
+    try { hash = String(location.hash || ''); } catch (e) { hash = ''; }
+    var at = hash.indexOf(XJ.syncCore.INSTALL_KEY);
+    if (at < 0) return Promise.resolve(false);
+    var body = hash.slice(at + XJ.syncCore.INSTALL_KEY.length);
+
+    var base = installBase();
+    /* ★ 立刻清掉地址栏里的载荷：否则每次刷新都会重放一次安装动作 */
+    try { history.replaceState(null, '', base + location.search); } catch (e) { /* 忽略 */ }
+
+    if (!syncAvailable()) {
+      UI.toast('这条接入口令需要在已部署的网址上打开（file:// 无法同步）', 4000);
+      return Promise.resolve(false);
+    }
+
+    var raw = XJ.syncCore.parsePairText(body) || body;
+    if (raw.indexOf(XJ.syncCore.PAIR_PREFIX) !== 0) {
+      /* 旧明文链接：同步解码，不需要等待 */
+      var plain = XJ.syncCore.decodeInstall(raw);
+      if (!plain) { UI.toast('这条链接没能识别，内容可能被截断了', 4000); return Promise.resolve(false); }
+      applyPairPayload(plain, base);
+      return Promise.resolve(true);
+    }
+    /* 加密口令：解完再把密钥留在本机（新设备之后生成的口令才有加密） */
+    return XJ.syncCore.decodePairCode(raw).then(function (r) {
+      if (!r || !r.ok) {
+        UI.toast(r && r.reason === 'no-crypto'
+          ? '这台设备的浏览器不提供加密接口，无法解开这条口令'
+          : '这条接入口令解不开：可能被截断或改动过', 4600);
+        return false;
+      }
+      var key = XJ.syncCore.pairKeyOf(raw);
+      if (key) { try { S.commit(function (s) { s.syncMeta.pairKey = key; }); } catch (e) { /* 忽略 */ } }
+      applyPairPayload({ token: r.token, gistId: r.gistId }, base);
+      return true;
+    });
   }
 
   UI.on('xferSnapshots', function (node) { XFER_SNAPSHOTS = !!node.checked; });
@@ -17344,7 +18826,11 @@ XJ.views.symbol = (function () {
     }).then(function (loaded) {
       var state;
       if (loaded) {
-        try { state = M.fromImport(loaded); }
+        /* ★ keepSync：这是【本机存档】而不是别人的备份，必须把同步设置带进来。
+           踩过：这里过去走的是 fromImport 的默认行为（丢弃 syncMeta），于是每开一次网页
+           都把开关、令牌、云端位置、设备身份与修订账本清空 —— 用户看到的现象就是
+           「每次打开同步都显示未开启」，而且本机记录被反复当成新增重推，最后被 GitHub 400 拒绝。 */
+        try { state = M.fromImport(loaded, { keepSync: true }); }
         catch (e) { console.warn('[load] 数据损坏，已重置', e); state = M.ensureBootstrapped(M.defaultState()); }
       } else {
         state = M.ensureBootstrapped(M.defaultState());
@@ -17354,12 +18840,19 @@ XJ.views.symbol = (function () {
       var dupFixed = 0;
       try { dupFixed = XJ.calc.dedupeDividends(state); } catch (e) { console.warn('[dedupe]', e); }
       S.init(state);
+      /* 一次性自愈：重建被旧 bug 清空的修订账本（必须在 sync.attach 之前跑完） */
+      var syncHealed = 0;
+      try { syncHealed = healSyncLedger(state) || 0; } catch (e) { console.warn('[sync-heal]', e); }
+      if (syncHealed) { try { XJ.storage.save(state); } catch (e) { /* 忽略 */ } }
       /* 跨设备同步：挂上「落盘前算出增量 op」的钩子。
          同步【默认关闭】—— 没开开关时这里只会把既有数据登记进修订账本，不发任何请求。 */
       if (XJ.sync && XJ.sync.attach) XJ.sync.attach();
       if (dupFixed) {
         XJ.storage.save(state);
         UI.toast('已合并 ' + dupFixed + ' 条重复的分红到账记录');
+      }
+      if (syncHealed) {
+        UI.toast('已修复同步记录（历史版本曾导致每次重开都清空同步设置）。本机与云端数据都没有被删除', 5200);
       }
       S.ui.accountId = C.ALL;
       UI.installDelegation();
@@ -17388,6 +18881,19 @@ XJ.views.symbol = (function () {
       firstPaint.then(function () {
         render();
         XJ.sync.start();          // 关闭状态下 start() 直接返回 false，不会建定时器
+        /* 给 uitest 用的调试入口：只暴露「已经存在的动作」，不新增任何能力。
+           没有它，「重载后同步设置还在吗」「切换位置真的把两边合起来了吗」
+           这两件最需要回归保护的事就只能靠人手点。 */
+        try {
+          XJ.__syncTest = {
+            switchLocation: switchSyncLocation,
+            applySwitch: applySwitch,
+            reseed: reseedSync,
+            makeCode: makePairCode,
+            useCode: usePairCode,
+            parseCode: function (t) { return XJ.syncCore.parsePairText(t); },
+          };
+        } catch (e) { /* 忽略 */ }
         /* 从带 #xjimport= 的链接打开 → 询问是否导入 */
         setTimeout(function () { checkImportHash(); }, 400);
         /* 派息日弹窗：这里试一次（分红方案本地就有缓存，离线也能弹），
